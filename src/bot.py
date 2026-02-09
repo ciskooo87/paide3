@@ -11,42 +11,109 @@ llm = LLM(
     api_key=os.getenv("GROQ_API_KEY")
 )
 
+# ==========================================
+# AGENTES REFINADOS
+# ==========================================
+
 roberto = Agent(
     role="Roberto - Senior Software Engineer",
-    goal="Desenvolver código Python profissional e resolver problemas técnicos",
-    backstory="Sou Roberto, engenheiro sênior com 10+ anos de experiência. Código limpo, soluções práticas. — Roberto 👷",
+    goal="Criar código Python PROFISSIONAL, limpo e pronto para produção",
+    backstory="""Sou Roberto, engenheiro de software sênior.
+
+MINHA ABORDAGEM:
+- Código LIMPO e TESTÁVEL (sigo PEP 8)
+- Sempre incluo docstrings e type hints
+- Foco em performance e manutenibilidade
+- Uso best practices da indústria
+- Explico o "porquê", não só o "como"
+
+FORMATO DAS MINHAS RESPOSTAS:
+1. Solução direta (código completo)
+2. Como executar
+3. Explicação técnica (breve)
+4. Otimizações possíveis (se relevante)
+
+NÃO FAÇO:
+❌ Código incompleto ou "pseudocódigo"
+❌ Explicações longas antes do código
+❌ Soluções genéricas sem contexto
+
+— Roberto 👷""",
     llm=llm,
     verbose=True,
     allow_delegation=False
 )
 
 curioso = Agent(
-    role="Curioso - Research Analyst",
-    goal="Analisar dados, pesquisar informações e gerar insights profundos",
-    backstory="Sou Curioso, pesquisador e analista. Análise profunda, múltiplas perspectivas, insights acionáveis. — Curioso 🔬",
+    role="Curioso - Senior Research Analyst",
+    goal="Fornecer análises OBJETIVAS com DADOS REAIS e insights práticos",
+    backstory="""Sou Curioso, analista sênior focado em RESULTADOS.
+
+MINHA ABORDAGEM:
+- DADOS PRIMEIRO: números, fatos, evidências
+- SEM ENROLAÇÃO: direto ao ponto
+- MÚLTIPLAS FONTES: sempre que possível
+- INSIGHTS ACIONÁVEIS: o que fazer com a informação
+- CONTEXTO REAL: exemplos concretos, não abstrações
+
+FORMATO DAS MINHAS RESPOSTAS:
+1. **Resposta Direta** (30-50 palavras)
+2. **Dados Chave** (números, fatos, evidências)
+3. **Contexto** (se necessário)
+4. **Insight Prático** (o que isso significa na prática)
+
+O QUE EU **NÃO** FAÇO:
+❌ Filosofar sem dados
+❌ "Pode ser X, pode ser Y, pode ser Z"
+❌ Respostas genéricas estilo "depende do contexto"
+❌ Encher linguiça com obviedades
+❌ Análises superficiais
+
+EXEMPLO RUIM (que evito):
+"Para responder sobre X, precisamos considerar múltiplas perspectivas..."
+
+EXEMPLO BOM (como respondo):
+"X é [definição concreta]. Dados: [números reais]. Impacto: [consequência prática]."
+
+Se NÃO tenho dados suficientes, digo CLARAMENTE:
+"Não encontrei informações específicas sobre [termo]. Vou analisar o contexto disponível..."
+
+— Curioso 🔬""",
     llm=llm,
     verbose=True,
     allow_delegation=False
 )
 
 marley = Agent(
-    role="Marley - AI Image Prompt Master",
-    goal="Criar prompts PERFEITOS otimizados para DALL-E, Midjourney, Stable Diffusion",
-    backstory="""Sou Marley, mestre em prompts de imagem.
+    role="Marley - Master Prompt Engineer",
+    goal="Criar prompts ÚNICOS e CRIATIVOS que geram imagens extraordinárias",
+    backstory="""Sou Marley, especialista em prompt engineering de elite.
 
-Crio prompts que geram imagens INCRÍVEIS em qualquer plataforma de IA.
+MINHA FILOSOFIA:
+- PROMPTS ÚNICOS: nunca genéricos ou clichês
+- DETALHES VISUAIS RICOS: cores, texturas, luz, mood
+- TÉCNICAS AVANÇADAS: composição, ângulos, estilo
+- REFERÊNCIAS ARTÍSTICAS: movimentos, artistas, técnicas
 
-FORMATO DA MINHA RESPOSTA:
-[1-2 frases sobre o conceito]
+ESTRUTURA DOS MEUS PROMPTS:
+1. Sujeito principal (detalhado)
+2. Estilo artístico (específico, não genérico)
+3. Composição e ângulo (criativo)
+4. Iluminação (atmosférica)
+5. Paleta de cores (única)
+6. Mood e atmosfera
+7. Qualidade técnica
 
-###PROMPT###
-[Prompt DETALHADO em inglês: 80-150 palavras incluindo sujeito, estilo, composição, iluminação, cores, mood, qualidade técnica]
+EVITO:
+❌ "Beautiful", "amazing", "stunning" (palavras vazias)
+❌ Prompts genéricos e previsíveis
+❌ Descrições técnicas sem alma
 
-###ONDE USAR###
-- DALL-E 3 (ChatGPT Plus)
-- Midjourney (Discord)
-- Leonardo.ai (gratuito)
-- Stable Diffusion (local)
+BUSCO:
+✅ Prompts cinematográficos
+✅ Referências artísticas específicas
+✅ Combinações inesperadas
+✅ Detalhes que fazem a diferença
 
 — Marley 🎨""",
     llm=llm,
@@ -54,11 +121,14 @@ FORMATO DA MINHA RESPOSTA:
     allow_delegation=False
 )
 
+# ==========================================
+# FUNÇÕES
+# ==========================================
+
 def extract_prompt(text):
     match = re.search(r'###PROMPT###\s*(.+?)(?:###|—|$)', text, re.IGNORECASE | re.DOTALL)
     if match:
         return match.group(1).strip()
-    # Fallback
     match2 = re.search(r'###IMAGE###\s*(.+?)(?:###|—|$)', text, re.IGNORECASE | re.DOTALL)
     if match2:
         return match2.group(1).strip()
@@ -89,35 +159,23 @@ async def send_long_message(update, text, parse_mode=None):
             await update.message.reply_text(f"(parte {i+1})\n\n{chunk}", parse_mode=parse_mode)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = """🤖 Time de Agentes IA - Online 24/7
+    msg = """🤖 Time de Agentes IA - Profissional
 
-👷 ROBERTO - Engenheiro de Software
-   • Código Python profissional
-   • Scripts e automações
-   • Soluções técnicas completas
+👷 ROBERTO - Engenheiro
+   Código Python production-ready
 
-🔬 CURIOSO - Analista & Pesquisador
-   • Análise profunda de dados
-   • Pesquisa e insights
-   • Recomendações estratégicas
+🔬 CURIOSO - Analista
+   Dados reais, zero enrolação
 
-🎨 MARLEY - Prompt Engineer
-   • Prompts OTIMIZADOS para IA
-   • DALL-E, Midjourney, SD
-   • Conceitos visuais profissionais
+🎨 MARLEY - Prompt Master
+   Prompts únicos e criativos
 
 Comandos:
-/roberto [tarefa] - Código e técnica
-/curioso [análise] - Pesquisa e insights
-/marley [visual] - Prompt para imagem
-/team [projeto] - Todos colaboram
-/status - Ver status
-
-Exemplos:
-/roberto crie código para calcular fibonacci
-/curioso analise tendências de IA em 2026
-/marley tigre robótico futurista cyberpunk
-/team desenvolva dashboard executivo CFO
+/roberto [tarefa]
+/curioso [pergunta]
+/marley [imagem]
+/team [projeto]
+/status
 """
     await update.message.reply_text(msg)
 
@@ -127,7 +185,21 @@ async def cmd_roberto(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     tarefa = ' '.join(context.args)
     await update.message.reply_text(f"👷 Roberto: {tarefa}")
-    task = Task(description=f"{tarefa}. Forneça código completo e explicações. — Roberto 👷", agent=roberto, expected_output="Solução")
+    
+    task = Task(
+        description=f"""{tarefa}
+
+INSTRUÇÕES:
+1. Código Python completo e funcional
+2. Docstrings e type hints
+3. Explicação BREVE e técnica
+4. Como executar
+
+— Roberto 👷""",
+        agent=roberto,
+        expected_output="Código profissional"
+    )
+    
     crew = Crew(agents=[roberto], tasks=[task], verbose=False)
     try:
         result = crew.kickoff()
@@ -137,11 +209,29 @@ async def cmd_roberto(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_curioso(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("❌ /curioso [análise]")
+        await update.message.reply_text("❌ /curioso [pergunta]")
         return
-    tarefa = ' '.join(context.args)
-    await update.message.reply_text(f"🔍 Curioso: {tarefa}")
-    task = Task(description=f"{tarefa}. Análise profunda com múltiplas perspectivas. — Curioso 🔬", agent=curioso, expected_output="Análise")
+    
+    pergunta = ' '.join(context.args)
+    await update.message.reply_text(f"🔍 Curioso: {pergunta}")
+    
+    task = Task(
+        description=f"""{pergunta}
+
+REGRAS ESTRITAS:
+1. Resposta DIRETA em 30-50 palavras
+2. DADOS concretos (números, fatos)
+3. ZERO filosofia vazia
+4. Se não souber, diga claramente
+
+NÃO escreva "múltiplas perspectivas" ou "depende do contexto".
+Seja DIRETO e OBJETIVO.
+
+— Curioso 🔬""",
+        agent=curioso,
+        expected_output="Análise objetiva com dados"
+    )
+    
     crew = Crew(agents=[curioso], tasks=[task], verbose=False)
     try:
         result = crew.kickoff()
@@ -151,70 +241,60 @@ async def cmd_curioso(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_marley(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("❌ /marley [descrição da imagem]")
+        await update.message.reply_text("❌ /marley [ideia]")
         return
     
-    descricao = ' '.join(context.args)
-    await update.message.reply_text(f"🎨 Marley criando prompt: {descricao}")
+    ideia = ' '.join(context.args)
+    await update.message.reply_text(f"🎨 Marley: {ideia}")
     
     task = Task(
-        description=f"""Crie um prompt PERFEITO para gerar: {descricao}
+        description=f"""{ideia}
 
-FORMATO OBRIGATÓRIO:
-1-2 frases sobre o conceito
+Crie um prompt CINEMATOGRÁFICO e ÚNICO.
 
+ESTRUTURA:
 ###PROMPT###
-[Prompt detalhado 80-150 palavras em INGLÊS incluindo:
-- Sujeito principal
-- Estilo artístico (photorealistic, digital art, oil painting, etc)
-- Composição (close-up, wide shot, aerial view, etc)
-- Iluminação (dramatic, soft, neon, golden hour, etc)
-- Cores dominantes e mood
-- Detalhes técnicos (4K, highly detailed, sharp focus)
-- Referências de qualidade (trending on artstation, award winning, masterpiece)]
+[Prompt detalhado 80-150 palavras]
 
-###ONDE USAR###
-Plataformas recomendadas
+INCLUA:
+- Estilo artístico específico
+- Composição criativa
+- Iluminação atmosférica
+- Paleta de cores única
+- Detalhes visuais ricos
+
+EVITE palavras vazias (beautiful, amazing, stunning).
 
 — Marley 🎨""",
         agent=marley,
-        expected_output="Prompt otimizado"
+        expected_output="Prompt criativo"
     )
     
     crew = Crew(agents=[marley], tasks=[task], verbose=False)
     
     try:
         result = str(crew.kickoff())
-        print(f"\n[MARLEY]\n{result}\n")
-        
         prompt = extract_prompt(result)
         
         if prompt:
-            # Monta resposta formatada
-            response = f"""🎨 **MARLEY - Prompt Pronto!**
+            response = f"""🎨 **MARLEY - Prompt Pronto**
 
-📋 **COPIE E USE ESTE PROMPT:**
+📋 **COPIE E USE:**
 ```
 {prompt}
 ```
 
 💡 **Onde usar:**
-- DALL-E 3: ChatGPT Plus (chat.openai.com)
-- Midjourney: Discord (midjourney.com)
-- Leonardo.ai: Gratuito (leonardo.ai)  
-- Stable Diffusion: Local ou online
-
-🔥 **Dica:** Copie o texto acima e cole direto na plataforma de sua escolha!
+- DALL-E 3 (ChatGPT Plus)
+- Midjourney (Discord)
+- Leonardo.ai (gratuito)
 
 ---
-Resposta completa:
-
 {result}
 """
             await send_long_message(update, response)
         else:
             await send_long_message(update, f"🖼️ Marley\n\n{result}")
-        
     except Exception as e:
         await update.message.reply_text(f"❌ {str(e)}")
 
@@ -222,42 +302,40 @@ async def cmd_team(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("❌ /team [projeto]")
         return
-    tarefa = ' '.join(context.args)
-    await update.message.reply_text(f"👥 Team: {tarefa}\n⏳ 30-90s...")
     
-    task_r = Task(description=f"Roberto: aspectos técnicos de {tarefa}", agent=roberto, expected_output="Análise técnica")
-    task_c = Task(description=f"Curioso: pesquise e analise {tarefa}", agent=curioso, expected_output="Insights")
-    task_m = Task(description=f"Marley: conceito visual para {tarefa}", agent=marley, expected_output="Conceito")
+    projeto = ' '.join(context.args)
+    await update.message.reply_text(f"👥 Team: {projeto}\n⏳ 30-90s...")
+    
+    task_r = Task(description=f"Roberto: aspectos técnicos de {projeto}", agent=roberto, expected_output="Solução")
+    task_c = Task(description=f"Curioso: dados e análise objetiva de {projeto}", agent=curioso, expected_output="Dados")
+    task_m = Task(description=f"Marley: conceito visual único para {projeto}", agent=marley, expected_output="Prompt")
     
     crew = Crew(agents=[roberto, curioso, marley], tasks=[task_r, task_c, task_m], verbose=False)
     
     try:
         result = str(crew.kickoff())
-        await send_long_message(update, f"🎯 Team Collaboration\n\n{result}")
+        await send_long_message(update, f"🎯 Team\n\n{result}")
     except Exception as e:
         await update.message.reply_text(f"❌ {str(e)}")
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"""✅ Status - {datetime.now().strftime('%d/%m/%Y %H:%M')}
+    await update.message.reply_text(f"""✅ {datetime.now().strftime('%d/%m %H:%M')}
 
 👷 Roberto - Online
-   Especialidade: Python, automação, arquitetura
+   Código production-ready
 
 🔬 Curioso - Online
-   Especialidade: Análise, pesquisa, insights
+   Análise objetiva, dados reais
 
 🎨 Marley - Online
-   Especialidade: Prompts IA otimizados
+   Prompts cinematográficos
 
-🟢 Todos agentes operacionais
+🟢 Todos operacionais
 """)
 
 def main():
-    print("🚀 Time de Agentes IA")
+    print("🚀 Time de Agentes IA - Versão Profissional")
     print(f"📅 {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n")
-    print("👷 Roberto - Engenheiro")
-    print("🔬 Curioso - Analista")
-    print("🎨 Marley - Prompt Master")
     
     app = Application.builder().token(os.getenv("TELEGRAM_BOT_TOKEN")).build()
     
@@ -268,7 +346,7 @@ def main():
     app.add_handler(CommandHandler("team", cmd_team))
     app.add_handler(CommandHandler("status", cmd_status))
     
-    print("\n✅ Configurado!")
+    print("✅ Configurado!")
     print("⏳ Aguardando no Telegram...\n")
     
     app.run_polling()
