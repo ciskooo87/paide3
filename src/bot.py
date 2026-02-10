@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 import os
 import sys
 from datetime import datetime
@@ -9,7 +9,6 @@ import re
 
 # Importa tools
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from tools.github_tool import GitHubTool
 from tools.websearch_tool import WebSearchTool
 from tools.imagegen_tool import ImageGeneratorTool
 
@@ -19,7 +18,6 @@ llm = LLM(
 )
 
 # Instancia tools
-github_tool = GitHubTool()
 search_tool = WebSearchTool()
 image_tool = ImageGeneratorTool()
 
@@ -266,7 +264,7 @@ Seja OBJETIVO e baseado em DADOS.
     crew = Crew(agents=[curioso], tasks=[task], verbose=False)
     
     try:
-        result = crew.kickoff()
+        result = str(crew.kickoff())
         await send_long_message(update, f"📊 Curioso\n\n{result}")
     except Exception as e:
         await update.message.reply_text(f"❌ {str(e)}")
@@ -381,8 +379,12 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     print("🚀 Time de Agentes V2.0 - AUTÔNOMOS")
     print(f"📅 {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n")
-    
-    app = Application.builder().token(os.getenv("TELEGRAM_BOT_TOKEN")).build()
+
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not bot_token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN não configurado")
+
+    app = Application.builder().token(bot_token).build()
     
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("roberto", cmd_roberto))
