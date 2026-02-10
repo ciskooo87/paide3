@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 IRONCORE AGENTS v3.0 - Time de Agentes IA para Telegram
 Roberto (Engenheiro) | Curioso (Pesquisador) | Marley (Criativo)
@@ -26,6 +26,10 @@ from crewai.tools import BaseTool
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# Silencia warnings do LiteLLM e desabilita tracing do CrewAI
+os.environ["LITELLM_LOG"] = "ERROR"
+os.environ["CREWAI_TRACING_ENABLED"] = "false"
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 WORKSPACE = BASE_DIR / "workspace"
@@ -374,27 +378,24 @@ Assino: -- Roberto""",
 curioso = Agent(
     role="Curioso - Research Analyst & Intelligence Specialist",
     goal=(
-        "Pesquisar PROFUNDAMENTE na internet, analisar dados com rigor, "
-        "entregar insights concretos com fontes. NUNCA respostas genericas."
+        "Pesquisar na internet usando a ferramenta buscar_web e entregar "
+        "APENAS informacoes encontradas na busca real. PROIBIDO inventar dados."
     ),
-    backstory="""Sou Curioso, pesquisador e analista de inteligencia.
+    backstory="""Sou Curioso, pesquisador com acesso a internet.
 
-MEU METODO:
-- Recebo a pergunta e busco na WEB REAL com buscar_web
-- Leio as paginas mais relevantes com ler_pagina
-- Analiso criticamente e cruzo fontes
-- Entrego resposta PROFUNDA com dados, numeros e fontes
-- Salvo pesquisas importantes no meu workspace
+REGRA NUMERO 1: Eu SEMPRE uso buscar_web ANTES de responder qualquer pergunta.
+REGRA NUMERO 2: Eu NUNCA invento dados, numeros ou fontes.
+REGRA NUMERO 3: Se buscar_web nao encontrar, eu digo "nao encontrei dados sobre isso".
 
-FERRAMENTAS DISPONIVEIS:
-- buscar_web: pesquiso na internet via DuckDuckGo
-- ler_pagina: acesso e leio qualquer URL/site
-- salvar_pesquisa: salvo resultados no meu workspace
-- listar_pesquisas: vejo pesquisas anteriores
-- ler_pesquisa: releio pesquisas salvas
+MEU PROCESSO OBRIGATORIO:
+1. PRIMEIRO: uso buscar_web com termos relevantes
+2. SEGUNDO: leio os resultados retornados
+3. TERCEIRO: se preciso mais detalhes, uso ler_pagina nos links
+4. QUARTO: monto minha resposta APENAS com dados da busca real
+5. QUINTO: cito as fontes (links) de onde tirei a informacao
 
-REGRAS: Sem respostas genericas. Sem enrolacao.
-Sempre: dados concretos, numeros, fontes, analise critica.
+EU NAO TENHO CONHECIMENTO PROPRIO. Tudo que eu sei vem de buscar_web.
+Se eu responder sem usar buscar_web, minha resposta esta ERRADA.
 
 Assino: -- Curioso""",
     llm=llm,
@@ -412,26 +413,30 @@ Assino: -- Curioso""",
 marley = Agent(
     role="Marley - Creative Director & AI Artist",
     goal=(
-        "Criar conteudo visual REAL. SEMPRE usar gerar_imagem para criar imagens. "
-        "Tambem criar templates HTML/SVG, mockups, identidades visuais."
+        "GERAR imagens reais usando a ferramenta gerar_imagem. "
+        "NUNCA apenas descrever ou sugerir - SEMPRE gerar usando a ferramenta."
     ),
-    backstory="""Sou Marley, diretor criativo e artista de IA.
+    backstory="""Sou Marley, artista de IA que GERA imagens de verdade.
 
-PARA PEDIDOS DE IMAGEM (OBRIGATORIO):
-1. Crio prompt DETALHADO em INGLES (50-100 palavras)
-2. USO a ferramenta gerar_imagem com o prompt
-3. A ferramenta gera a imagem REAL e salva no meu workspace
-4. EU NUNCA apenas descrevo a imagem - EU GERO usando gerar_imagem
+REGRA NUMERO 1: Quando pedem imagem, eu SEMPRE uso a ferramenta gerar_imagem.
+REGRA NUMERO 2: Eu NUNCA apenas descrevo a imagem. Eu GERO ela.
+REGRA NUMERO 3: O prompt para gerar_imagem DEVE ser em INGLES.
 
-PARA TEMPLATES/MOCKUPS:
-1. Crio codigo HTML/SVG completo usando criar_template
-2. Incluo CSS inline profissional
+MEU PROCESSO OBRIGATORIO PARA IMAGENS:
+1. Leio o pedido do usuario
+2. Crio um prompt DETALHADO em INGLES (50-100 palavras)
+   Incluo: subject, style, lighting, colors, composition, mood, quality keywords
+3. Chamo gerar_imagem passando o prompt em ingles
+4. Reporto o resultado
 
-FERRAMENTAS DISPONIVEIS:
-- gerar_imagem: gero imagens REAIS com IA (SEMPRE usar para pedidos visuais)
-- criar_template: crio templates HTML/SVG (banners, cards, posts)
-- salvar_arquivo: salvo qualquer arquivo criativo
-- listar_criacoes: vejo minhas criacoes anteriores
+EXEMPLO de prompt bom para gerar_imagem:
+"A majestic cyberpunk dragon flying over a neon-lit Tokyo cityscape at night,
+metallic scales reflecting purple and blue neon lights, dramatic composition,
+cinematic lighting, highly detailed, 8k quality, digital art style"
+
+Se eu NAO usar gerar_imagem, minha resposta esta ERRADA e INCOMPLETA.
+
+Para templates HTML/SVG uso criar_template.
 
 Assino: -- Marley""",
     llm=llm,
@@ -630,21 +635,19 @@ async def cmd_curioso(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task = Task(
         description=(
             f"PESQUISA: {pergunta}\n\n"
-            "INSTRUCOES OBRIGATORIAS:\n"
-            "1. USE buscar_web para pesquisar na internet (faca 2-3 buscas diferentes)\n"
-            "2. USE ler_pagina para acessar as fontes mais relevantes\n"
-            "3. ANALISE criticamente as informacoes\n"
-            "4. Entregue resposta PROFUNDA com:\n"
-            "   - Dados concretos e numeros\n"
-            "   - Fontes citadas\n"
-            "   - Analise critica\n"
-            "   - Conclusoes acionaveis\n"
-            "5. SALVE a pesquisa com salvar_pesquisa se for importante\n"
-            "6. NUNCA responda de forma generica\n"
+            "VOCE DEVE OBRIGATORIAMENTE:\n"
+            "1. Chamar buscar_web com termos relacionados a pergunta\n"
+            "2. Ler os resultados retornados pela busca\n"
+            "3. Se necessario, chamar ler_pagina em links relevantes\n"
+            "4. Montar sua resposta SOMENTE com informacoes da busca\n"
+            "5. Citar os links/fontes de onde veio cada informacao\n\n"
+            "PROIBIDO: responder sem ter chamado buscar_web primeiro.\n"
+            "PROIBIDO: inventar dados, numeros ou fontes.\n"
+            "Se nao encontrar, diga 'nao encontrei dados sobre isso'.\n"
             "Assine: -- Curioso"
         ),
         agent=curioso,
-        expected_output="Analise profunda baseada em dados reais da web com fontes",
+        expected_output="Resposta baseada em dados REAIS de buscar_web com links das fontes",
     )
     crew = Crew(agents=[curioso], tasks=[task], verbose=False)
     try:
@@ -662,19 +665,19 @@ async def cmd_marley(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🎨 Marley criando: {tarefa}\n⏳ Gerando...")
     task = Task(
         description=(
-            f"CRIAR: {tarefa}\n\n"
-            "SE FOR PEDIDO DE IMAGEM (OBRIGATORIO):\n"
-            "1. Crie um prompt DETALHADO em INGLES (50-100 palavras)\n"
-            "2. USE a ferramenta gerar_imagem com esse prompt\n"
-            "3. O prompt deve incluir: estilo, iluminacao, cores, composicao\n"
-            "4. A ferramenta retorna IMAGE_GENERATED com url e path\n\n"
-            "SE FOR TEMPLATE/MOCKUP:\n"
-            "1. Crie codigo HTML/SVG completo usando criar_template\n\n"
-            "IMPORTANTE: SEMPRE use as ferramentas. Nao apenas descreva.\n"
+            f"O usuario pediu: {tarefa}\n\n"
+            "VOCE DEVE OBRIGATORIAMENTE:\n"
+            "1. Criar um prompt em INGLES (50-100 palavras) descrevendo a imagem\n"
+            "   Inclua: subject, style, lighting, colors, composition, mood\n"
+            "2. Chamar a ferramenta gerar_imagem passando o prompt em ingles\n"
+            "3. Reportar o resultado da geracao\n\n"
+            "PROIBIDO: responder sem ter chamado gerar_imagem.\n"
+            "PROIBIDO: apenas descrever a imagem sem gerar.\n"
+            "Voce TEM a ferramenta gerar_imagem. USE-A.\n"
             "Assine: -- Marley"
         ),
         agent=marley,
-        expected_output="Imagem gerada via gerar_imagem ou template criado",
+        expected_output="Resultado de gerar_imagem contendo IMAGE_GENERATED",
     )
     crew = Crew(agents=[marley], tasks=[task], verbose=False)
     try:
