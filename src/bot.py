@@ -1,402 +1,838 @@
 # -*- coding: utf-8 -*-
+"""
+IRONCORE AGENTS v3.0 - Time de Agentes IA para Telegram
+Roberto (Engenheiro) | Curioso (Pesquisador) | Marley (Criativo)
+Cada agente tem workspace proprio e ferramentas reais.
+Deploy: Render.com Background Worker
+"""
+
 import os
-import sys
+import re
+import subprocess
 from datetime import datetime
+from io import BytesIO
+from pathlib import Path
+
+import requests
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from crewai import Agent, Task, Crew, LLM
-import re
+from crewai.tools import BaseTool
 
-# Importa tools
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from tools.websearch_tool import WebSearchTool
-from tools.imagegen_tool import ImageGeneratorTool
+# ============================================================
+# CONFIGURACAO
+# ============================================================
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+WORKSPACE = BASE_DIR / "workspace"
+WS_ROBERTO = WORKSPACE / "roberto"
+WS_CURIOSO = WORKSPACE / "curioso"
+WS_MARLEY = WORKSPACE / "marley"
+
+for d in (WS_ROBERTO, WS_CURIOSO, WS_MARLEY):
+    d.mkdir(parents=True, exist_ok=True)
 
 llm = LLM(
     model="groq/llama-3.3-70b-versatile",
-    api_key=os.getenv("GROQ_API_KEY")
+    api_key=GROQ_API_KEY,
+    temperature=0.3,
 )
 
-# Instancia tools
-search_tool = WebSearchTool()
-image_tool = ImageGeneratorTool()
+# ============================================================
+# FERRAMENTAS - ROBERTO
+# ============================================================
 
-# ==========================================
-# AGENTES V2.0 - AUTÔNOMOS E PODEROSOS
-# ==========================================
+class RobertoCreateFile(BaseTool):
+    name: str = "criar_arquivo"
+    description: str = (
+        "Cria ou sobrescreve um arquivo no workspace do Roberto. "
+        "Parametros: filename (ex: app.py) e content (conteudo completo do arquivo)."
+    )
+    def _run(self, filename: str = "", content: str = "", **kw) -> str:
+        fn = filename or kw.get("file_name", kw.get("name", "output.py"))
+        ct = content or kw.get("file_content", kw.get("code", ""))
+        try:
+            path = WS_ROBERTO / fn
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(ct, encoding="utf-8")
+            return f"OK Arquivo criado: workspace/roberto/{fn} ({len(ct)} bytes)"
+        except Exception as e:
+            return f"ERRO: {e}"
+
+
+class RobertoExecuteCode(BaseTool):
+    name: str = "executar_python"
+    description: str = (
+        "Executa codigo Python no workspace do Roberto e retorna o resultado. "
+        "Parametro: code (codigo Python completo a ser executado)."
+    )
+    def _run(self, code: str = "", **kw) -> str:
+        code = code or kw.get("python_code", kw.get("script", ""))
+        try:
+            tmp = WS_ROBERTO / "_run.py"
+            tmp.write_text(code, encoding="utf-8")
+            r = subprocess.run(
+                ["python3", str(tmp)],
+                capture_output=True, text=True, timeout=30,
+                cwd=str(WS_ROBERTO),
+            )
+            out = ""
+            if r.stdout:
+                out += r.stdout
+            if r.stderr:
+                out += f"\nSTDERR:\n{r.stderr}"
+            return (out or "OK executado sem output").strip()[:3000]
+        except subprocess.TimeoutExpired:
+            return "ERRO Timeout (30s)"
+        except Exception as e:
+            return f"ERRO {e}"
+
+
+class RobertoReadFile(BaseTool):
+    name: str = "ler_arquivo"
+    description: str = (
+        "Le o conteudo de um arquivo do workspace do Roberto. "
+        "Parametro: filename (caminho relativo, ex: app.py)."
+    )
+    def _run(self, filename: str = "", **kw) -> str:
+        fn = filename or kw.get("file_name", kw.get("path", ""))
+        try:
+            path = WS_ROBERTO / fn
+            if not path.exists():
+                return f"ERRO nao encontrado: {fn}"
+            return path.read_text(encoding="utf-8")[:4000]
+        except Exception as e:
+            return f"ERRO {e}"
+
+
+class RobertoListFiles(BaseTool):
+    name: str = "listar_workspace"
+    description: str = "Lista todos os arquivos no workspace do Roberto."
+    def _run(self, **kw) -> str:
+        try:
+            files = [f for f in WS_ROBERTO.rglob("*") if f.is_file() and not f.name.startswith("_")]
+            if not files:
+                return "Workspace vazio"
+            return "Arquivos:\n" + "\n".join(f"  {f.relative_to(WS_ROBERTO)}" for f in files[:30])
+        except Exception as e:
+            return f"ERRO {e}"
+
+
+class RobertoBash(BaseTool):
+    name: str = "executar_bash"
+    description: str = (
+        "Executa um comando bash/shell no workspace do Roberto. "
+        "Parametro: command (comando a executar). "
+        "Util para: pip install, git, ls, cat, etc."
+    )
+    def _run(self, command: str = "", **kw) -> str:
+        cmd = command or kw.get("cmd", "")
+        blocked = ["rm -rf /", "mkfs", "dd if=", ":(){"]
+        if any(b in cmd for b in blocked):
+            return "ERRO comando bloqueado"
+        try:
+            r = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True,
+                timeout=30, cwd=str(WS_ROBERTO),
+            )
+            out = (r.stdout + "\n" + r.stderr).strip()
+            return (out or "OK")[:3000]
+        except subprocess.TimeoutExpired:
+            return "ERRO Timeout"
+        except Exception as e:
+            return f"ERRO {e}"
+
+
+# ============================================================
+# FERRAMENTAS - CURIOSO
+# ============================================================
+
+class CuriosoWebSearch(BaseTool):
+    name: str = "buscar_web"
+    description: str = (
+        "Busca informacoes na internet via DuckDuckGo. "
+        "Parametro: query (termo de busca). "
+        "Retorna os 5 melhores resultados com titulo, resumo e link."
+    )
+    def _run(self, query: str = "", **kw) -> str:
+        q = query or kw.get("search_query", kw.get("term", ""))
+        try:
+            from duckduckgo_search import DDGS
+            results = []
+            with DDGS() as ddgs:
+                for r in ddgs.text(q, max_results=5):
+                    results.append(f"TITULO: {r['title']}\nRESUMO: {r['body'][:300]}\nLINK: {r['href']}")
+            return "\n\n".join(results) if results else "Nenhum resultado"
+        except Exception as e:
+            return f"ERRO: {e}"
+
+
+class CuriosoWebFetch(BaseTool):
+    name: str = "ler_pagina"
+    description: str = (
+        "Acessa uma URL e extrai o conteudo de texto da pagina. "
+        "Parametro: url (endereco completo com https://). "
+        "Util para ler artigos, docs, noticias."
+    )
+    def _run(self, url: str = "", **kw) -> str:
+        u = url or kw.get("page_url", kw.get("link", ""))
+        try:
+            resp = requests.get(u, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+            from html.parser import HTMLParser
+            class TE(HTMLParser):
+                def __init__(self):
+                    super().__init__()
+                    self.t = []
+                    self._s = False
+                def handle_starttag(self, tag, a):
+                    if tag in ("script", "style", "nav", "footer"):
+                        self._s = True
+                def handle_endtag(self, tag):
+                    if tag in ("script", "style", "nav", "footer"):
+                        self._s = False
+                def handle_data(self, d):
+                    if not self._s and d.strip():
+                        self.t.append(d.strip())
+            p = TE()
+            p.feed(resp.text)
+            return "\n".join(p.t)[:4000]
+        except Exception as e:
+            return f"ERRO {e}"
+
+
+class CuriosoSaveResearch(BaseTool):
+    name: str = "salvar_pesquisa"
+    description: str = (
+        "Salva resultado de pesquisa em arquivo no workspace do Curioso. "
+        "Parametros: filename (nome do arquivo) e content (conteudo)."
+    )
+    def _run(self, filename: str = "", content: str = "", **kw) -> str:
+        fn = filename or kw.get("file_name", f"pesquisa_{datetime.now():%Y%m%d_%H%M}.md")
+        ct = content or kw.get("text", "")
+        try:
+            (WS_CURIOSO / fn).write_text(ct, encoding="utf-8")
+            return f"OK salvo: workspace/curioso/{fn}"
+        except Exception as e:
+            return f"ERRO {e}"
+
+
+class CuriosoListFiles(BaseTool):
+    name: str = "listar_pesquisas"
+    description: str = "Lista arquivos salvos no workspace do Curioso."
+    def _run(self, **kw) -> str:
+        files = [f for f in WS_CURIOSO.rglob("*") if f.is_file()]
+        if not files:
+            return "Workspace vazio"
+        return "Pesquisas:\n" + "\n".join(f"  {f.relative_to(WS_CURIOSO)}" for f in files[:20])
+
+
+class CuriosoReadFile(BaseTool):
+    name: str = "ler_pesquisa"
+    description: str = (
+        "Le o conteudo de um arquivo do workspace do Curioso. "
+        "Parametro: filename."
+    )
+    def _run(self, filename: str = "", **kw) -> str:
+        fn = filename or kw.get("file_name", "")
+        try:
+            path = WS_CURIOSO / fn
+            if not path.exists():
+                return f"ERRO nao encontrado: {fn}"
+            return path.read_text(encoding="utf-8")[:4000]
+        except Exception as e:
+            return f"ERRO {e}"
+
+
+# ============================================================
+# FERRAMENTAS - MARLEY
+# ============================================================
+
+class MarleyGenerateImage(BaseTool):
+    name: str = "gerar_imagem"
+    description: str = (
+        "Gera uma imagem REAL usando IA (Pollinations API, gratis). "
+        "Parametro: prompt (descricao DETALHADA da imagem em INGLES, 30-100 palavras). "
+        "SEMPRE use esta ferramenta quando pedirem imagem/arte/visual. "
+        "Retorna: IMAGE_GENERATED seguido da url e caminho local."
+    )
+    def _run(self, prompt: str = "", **kw) -> str:
+        p = prompt or kw.get("image_prompt", kw.get("description", ""))
+        try:
+            encoded = requests.utils.quote(p)
+            url = f"https://gen.pollinations.ai/image/{encoded}?width=1024&height=1024&nologo=true&enhance=true"
+            print(f"[MARLEY] Gerando imagem: {url[:120]}...")
+            resp = requests.get(url, timeout=120, stream=True)
+            if resp.status_code == 200:
+                ct = resp.headers.get("content-type", "")
+                # Verifica se retornou imagem de verdade
+                img_data = b""
+                for chunk in resp.iter_content(8192):
+                    img_data += chunk
+                if len(img_data) < 500:
+                    return f"ERRO imagem muito pequena ({len(img_data)} bytes), API pode estar indisponivel"
+                img_name = f"img_{datetime.now():%Y%m%d_%H%M%S}.png"
+                img_path = WS_MARLEY / img_name
+                img_path.write_bytes(img_data)
+                print(f"[MARLEY] Imagem salva: {img_path} ({len(img_data)} bytes)")
+                return f"IMAGE_GENERATED url={url} path={img_path} size={len(img_data)}"
+            return f"ERRO HTTP {resp.status_code}"
+        except requests.Timeout:
+            return "ERRO timeout na geracao (API lenta, tente novamente)"
+        except Exception as e:
+            return f"ERRO {e}"
+
+
+class MarleyCreateTemplate(BaseTool):
+    name: str = "criar_template"
+    description: str = (
+        "Cria template HTML/SVG (banner, card, post, logo, mockup). "
+        "Parametros: filename (ex: banner.html) e content (codigo HTML/SVG completo)."
+    )
+    def _run(self, filename: str = "", content: str = "", **kw) -> str:
+        fn = filename or kw.get("file_name", "template.html")
+        ct = content or kw.get("html_content", kw.get("code", ""))
+        try:
+            (WS_MARLEY / fn).write_text(ct, encoding="utf-8")
+            return f"OK template: workspace/marley/{fn}"
+        except Exception as e:
+            return f"ERRO {e}"
+
+
+class MarleyListFiles(BaseTool):
+    name: str = "listar_criacoes"
+    description: str = "Lista arquivos no workspace do Marley."
+    def _run(self, **kw) -> str:
+        files = [f for f in WS_MARLEY.rglob("*") if f.is_file()]
+        if not files:
+            return "Workspace vazio"
+        return "Criacoes:\n" + "\n".join(f"  {f.relative_to(WS_MARLEY)}" for f in files[:20])
+
+
+class MarleySaveFile(BaseTool):
+    name: str = "salvar_arquivo"
+    description: str = (
+        "Salva qualquer arquivo no workspace do Marley (CSS, JSON, texto, etc). "
+        "Parametros: filename e content."
+    )
+    def _run(self, filename: str = "", content: str = "", **kw) -> str:
+        fn = filename or kw.get("file_name", "output.txt")
+        ct = content or kw.get("text", "")
+        try:
+            (WS_MARLEY / fn).write_text(ct, encoding="utf-8")
+            return f"OK salvo: workspace/marley/{fn}"
+        except Exception as e:
+            return f"ERRO {e}"
+
+
+# ============================================================
+# AGENTES
+# ============================================================
 
 roberto = Agent(
-    role="Roberto - Autonomous Software Engineer",
-    goal="Desenvolver projetos completos, testá-los e publicar no GitHub",
-    backstory="""Sou Roberto, desenvolvedor autônomo de software.
+    role="Roberto - Senior Software Engineer",
+    goal=(
+        "Entregar projetos de software COMPLETOS e FUNCIONAIS. "
+        "NUNCA dar passo-a-passo ou tutorial. "
+        "Sempre: 1) Criar TODOS os arquivos usando criar_arquivo, "
+        "2) Testar com executar_python, 3) Entregar PRONTO."
+    ),
+    backstory="""Sou Roberto, engenheiro de software senior com 15+ anos.
 
-MINHAS CAPACIDADES:
-- Criar projetos Python completos do zero
-- Escrever código limpo e profissional
-- Testar e debugar
-- Fazer push automático para GitHub
-- Entregar projetos 100% funcionais
+MEU METODO:
+- Recebo a tarefa e crio TODOS os arquivos no meu workspace
+- Testo o codigo executando-o e corrijo se necessario
+- Entrego o projeto COMPLETO e FUNCIONAL
+- NUNCA dou instrucoes passo-a-passo. EU FACO o trabalho.
 
-MINHA ÁREA DE TRABALHO:
-/workspace/roberto/ - onde crio e testo tudo
+FERRAMENTAS DISPONIVEIS:
+- criar_arquivo: crio qualquer arquivo (Python, JS, HTML, JSON, YAML, etc)
+- executar_python: executo e testo codigo Python
+- executar_bash: rodo comandos shell (pip install, git, etc)
+- ler_arquivo: leio arquivos existentes
+- listar_workspace: vejo meus arquivos
 
-WORKFLOW:
-1. Entendo o projeto
-2. Crio estrutura e código
-3. Testo localmente
-4. Faço push para GitHub
-5. Entrego link do repositório
+ESPECIALIDADES: Python, APIs, automacao, ETL, web scraping, bots,
+arquitetura de sistemas, microservicos, bancos de dados.
 
-NÃO FAÇO:
-❌ Código incompleto
-❌ Projetos pela metade
-❌ Explicações longas sem código
-
-FORMATO DE RESPOSTA:
-**Projeto:** [nome]
-**Repo:** [link GitHub]
-**Arquivos:** [lista]
-**Como executar:** [comandos]
-
-— Roberto 👷""",
+Assino: -- Roberto""",
     llm=llm,
-    verbose=True,
-    allow_delegation=False
+    verbose=False,
+    allow_delegation=False,
+    tools=[
+        RobertoCreateFile(),
+        RobertoExecuteCode(),
+        RobertoReadFile(),
+        RobertoListFiles(),
+        RobertoBash(),
+    ],
 )
 
 curioso = Agent(
-    role="Curioso - Deep Research Analyst",
-    goal="Pesquisar PROFUNDAMENTE na web e fornecer dados reais e insights",
-    backstory="""Sou Curioso, pesquisador com acesso REAL à internet.
+    role="Curioso - Research Analyst & Intelligence Specialist",
+    goal=(
+        "Pesquisar PROFUNDAMENTE na internet, analisar dados com rigor, "
+        "entregar insights concretos com fontes. NUNCA respostas genericas."
+    ),
+    backstory="""Sou Curioso, pesquisador e analista de inteligencia.
 
-MINHAS CAPACIDADES:
-- Buscar informações ATUAIS na web
-- Analisar múltiplas fontes
-- Extrair dados de páginas específicas
-- Validar informações
-- Fornecer insights acionáveis
+MEU METODO:
+- Recebo a pergunta e busco na WEB REAL com buscar_web
+- Leio as paginas mais relevantes com ler_pagina
+- Analiso criticamente e cruzo fontes
+- Entrego resposta PROFUNDA com dados, numeros e fontes
+- Salvo pesquisas importantes no meu workspace
 
-COMO TRABALHO:
-1. Busco em múltiplas fontes
-2. Analiso criticamente os dados
-3. Valido informações
-4. Sintetizo insights práticos
+FERRAMENTAS DISPONIVEIS:
+- buscar_web: pesquiso na internet via DuckDuckGo
+- ler_pagina: acesso e leio qualquer URL/site
+- salvar_pesquisa: salvo resultados no meu workspace
+- listar_pesquisas: vejo pesquisas anteriores
+- ler_pesquisa: releio pesquisas salvas
 
-NÃO FAÇO:
-❌ Respostas genéricas sem pesquisa
-❌ Filosofar sem dados
-❌ "Depende do contexto"
+REGRAS: Sem respostas genericas. Sem enrolacao.
+Sempre: dados concretos, numeros, fontes, analise critica.
 
-FORMATO:
-**Pesquisa:** [termo]
-**Fontes:** [3-5 fontes]
-**Dados:** [informações concretas]
-**Insight:** [o que isso significa]
-
-— Curioso 🔬""",
+Assino: -- Curioso""",
     llm=llm,
-    verbose=True,
-    allow_delegation=False
+    verbose=False,
+    allow_delegation=False,
+    tools=[
+        CuriosoWebSearch(),
+        CuriosoWebFetch(),
+        CuriosoSaveResearch(),
+        CuriosoListFiles(),
+        CuriosoReadFile(),
+    ],
 )
 
 marley = Agent(
-    role="Marley - Creative Visual Generator",
-    goal="Criar visuais reais: imagens, mockups, logos, designs",
-    backstory="""Sou Marley, criador visual com IA generativa.
+    role="Marley - Creative Director & AI Artist",
+    goal=(
+        "Criar conteudo visual REAL. SEMPRE usar gerar_imagem para criar imagens. "
+        "Tambem criar templates HTML/SVG, mockups, identidades visuais."
+    ),
+    backstory="""Sou Marley, diretor criativo e artista de IA.
 
-MINHAS CAPACIDADES:
-- Gerar imagens REAIS com IA
-- Criar logos e identidades visuais
-- Mockups de interfaces
-- Material visual profissional
+PARA PEDIDOS DE IMAGEM (OBRIGATORIO):
+1. Crio prompt DETALHADO em INGLES (50-100 palavras)
+2. USO a ferramenta gerar_imagem com o prompt
+3. A ferramenta gera a imagem REAL e salva no meu workspace
+4. EU NUNCA apenas descrevo a imagem - EU GERO usando gerar_imagem
 
-COMO TRABALHO:
-1. Entendo o conceito
-2. Crio prompt otimizado
-3. Gero a imagem
-4. Entrego o visual pronto
+PARA TEMPLATES/MOCKUPS:
+1. Crio codigo HTML/SVG completo usando criar_template
+2. Incluo CSS inline profissional
 
-NÃO FAÇO:
-❌ Só prompts sem imagem
-❌ Descrições sem criação
-❌ Conceitos sem execução
+FERRAMENTAS DISPONIVEIS:
+- gerar_imagem: gero imagens REAIS com IA (SEMPRE usar para pedidos visuais)
+- criar_template: crio templates HTML/SVG (banners, cards, posts)
+- salvar_arquivo: salvo qualquer arquivo criativo
+- listar_criacoes: vejo minhas criacoes anteriores
 
-FORMATO:
-**Conceito:** [descrição]
-**Imagem:** [entrego a imagem]
-**Uso sugerido:** [onde usar]
-
-— Marley 🎨""",
+Assino: -- Marley""",
     llm=llm,
-    verbose=True,
-    allow_delegation=False
+    verbose=False,
+    allow_delegation=False,
+    tools=[
+        MarleyGenerateImage(),
+        MarleyCreateTemplate(),
+        MarleyListFiles(),
+        MarleySaveFile(),
+    ],
 )
 
-# ==========================================
-# COMANDOS
-# ==========================================
+# ============================================================
+# FUNCOES AUXILIARES TELEGRAM
+# ============================================================
 
-def split_message(text, max_length=4000):
-    if len(text) <= max_length:
+def split_message(text, max_len=4000):
+    text = str(text)
+    if len(text) <= max_len:
         return [text]
     chunks = []
     current = ""
-    for para in text.split('\n\n'):
-        if len(current) + len(para) + 2 <= max_length:
-            current += para + '\n\n'
+    for para in text.split("\n\n"):
+        if len(current) + len(para) + 2 <= max_len:
+            current += para + "\n\n"
         else:
             if current:
                 chunks.append(current.strip())
-            current = para + '\n\n'
-    if current:
+            if len(para) > max_len:
+                for i in range(0, len(para), max_len):
+                    chunks.append(para[i : i + max_len])
+                current = ""
+            else:
+                current = para + "\n\n"
+    if current.strip():
         chunks.append(current.strip())
-    return chunks
+    return chunks if chunks else [text[:max_len]]
 
-async def send_long_message(update, text):
-    chunks = split_message(text)
-    for i, chunk in enumerate(chunks):
-        if i == 0:
-            await update.message.reply_text(chunk)
-        else:
-            await update.message.reply_text(f"(parte {i+1})\n\n{chunk}")
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = """🤖 Time de Agentes IA V2.0 - AUTÔNOMOS
+async def send_long(update, text, parse_mode=None):
+    for i, chunk in enumerate(split_message(text)):
+        try:
+            prefix = f"(parte {i + 1})\n\n" if i > 0 else ""
+            await update.message.reply_text(prefix + chunk, parse_mode=parse_mode)
+        except Exception:
+            try:
+                await update.message.reply_text(chunk[:4000])
+            except Exception:
+                pass
 
-👷 ROBERTO - Desenvolvedor
-   ✓ Cria projetos completos
-   ✓ Testa e publica no GitHub
-   ✓ Workspace próprio
 
-🔬 CURIOSO - Pesquisador
-   ✓ Acesso real à internet
-   ✓ Pesquisa profunda
-   ✓ Dados e insights
+async def try_send_image(update, result_text):
+    """Tenta extrair imagem do resultado e enviar no Telegram."""
+    text = str(result_text)
 
-🎨 MARLEY - Criador Visual
-   ✓ Gera imagens reais
-   ✓ Logos e mockups
-   ✓ Material visual
+    # Padrao IMAGE_GENERATED url=... path=...
+    match = re.search(r'IMAGE_GENERATED\s+url=(\S+)\s+path=(\S+)', text)
+    if match:
+        url = match.group(1)
+        local_path = match.group(2)
+        # Tenta arquivo local
+        try:
+            if os.path.exists(local_path):
+                size = os.path.getsize(local_path)
+                if size > 500:
+                    with open(local_path, "rb") as f:
+                        await update.message.reply_photo(
+                            photo=f,
+                            caption="🎨 Imagem gerada por Marley"
+                        )
+                    return True
+        except Exception as ex:
+            print(f"[WARN] Falha envio local: {ex}")
 
-Comandos:
-/roberto [projeto] - Cria e publica
-/curioso [pesquisa] - Busca na web
-/marley [visual] - Cria imagem
-/team [projeto completo]
-/status
-"""
-    await update.message.reply_text(msg)
+        # Fallback: baixa da URL
+        try:
+            resp = requests.get(url, timeout=90)
+            if resp.status_code == 200 and len(resp.content) > 500:
+                await update.message.reply_photo(
+                    photo=BytesIO(resp.content),
+                    caption="🎨 Imagem gerada por Marley"
+                )
+                return True
+        except Exception as ex:
+            print(f"[WARN] Falha envio URL: {ex}")
+
+        # Ultimo fallback: link
+        await update.message.reply_text(f"🎨 Imagem gerada:\n{url}")
+        return True
+
+    # Busca URLs gen.pollinations.ai soltas no texto
+    urls = re.findall(r'https://gen\.pollinations\.ai/image/[^\s\)\"\'<>]+', text)
+    if not urls:
+        urls = re.findall(r'https://image\.pollinations\.ai/[^\s\)\"\'<>]+', text)
+    for url in urls[:1]:
+        try:
+            resp = requests.get(url, timeout=90)
+            if resp.status_code == 200 and len(resp.content) > 500:
+                await update.message.reply_photo(
+                    photo=BytesIO(resp.content),
+                    caption="🎨 Imagem gerada por Marley"
+                )
+                return True
+        except Exception:
+            pass
+        await update.message.reply_text(f"🎨 Imagem:\n{url}")
+        return True
+
+    # Verifica se tem arquivo de imagem no workspace do Marley
+    imgs = sorted(WS_MARLEY.glob("img_*.png"), reverse=True)
+    if imgs:
+        latest = imgs[0]
+        if latest.stat().st_size > 500:
+            age = (datetime.now() - datetime.fromtimestamp(latest.stat().st_mtime)).seconds
+            if age < 120:  # criada nos ultimos 2 minutos
+                try:
+                    with open(latest, "rb") as f:
+                        await update.message.reply_photo(
+                            photo=f,
+                            caption="🎨 Imagem gerada por Marley"
+                        )
+                    return True
+                except Exception:
+                    pass
+
+    return False
+
+
+# ============================================================
+# COMANDOS DO BOT
+# ============================================================
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤖 IRONCORE AGENTS v3.0\n\n"
+        "👷 ROBERTO — Engenheiro de Software\n"
+        "   Cria projetos completos, executa codigo, testa e entrega.\n"
+        "   Workspace: /workspace/roberto/\n"
+        "   /roberto [tarefa]\n\n"
+        "🔬 CURIOSO — Pesquisador & Analista\n"
+        "   Pesquisa na web real, analisa dados, entrega insights.\n"
+        "   Workspace: /workspace/curioso/\n"
+        "   /curioso [pergunta]\n\n"
+        "🎨 MARLEY — Diretor Criativo & Artista IA\n"
+        "   Gera imagens reais com IA, cria templates e mockups.\n"
+        "   Workspace: /workspace/marley/\n"
+        "   /marley [visual]\n\n"
+        "👥 TEAM — Colaboracao Integrada\n"
+        "   Os 3 agentes trabalhando juntos.\n"
+        "   /team [projeto]\n\n"
+        "Outros: /status /workspace /limpar\n\n"
+        "Exemplos:\n"
+        "  /roberto crie uma API Flask com CRUD de usuarios\n"
+        "  /curioso pesquise mercado de FIDCs no Brasil\n"
+        "  /marley crie imagem de dragao cyberpunk\n"
+        "  /team crie landing page para fintech"
+    )
+
 
 async def cmd_roberto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("❌ /roberto [descrição do projeto]")
+        await update.message.reply_text("❌ Uso: /roberto [tarefa]\nEx: /roberto crie script para analise de CSV")
         return
-    
-    projeto = ' '.join(context.args)
-    await update.message.reply_text(f"👷 Roberto iniciando: {projeto}\n\n⏳ Criando projeto...")
-    
+    tarefa = " ".join(context.args)
+    await update.message.reply_text(f"👷 Roberto recebeu: {tarefa}\n⏳ Trabalhando...")
     task = Task(
-        description=f"""PROJETO: {projeto}
-
-INSTRUÇÕES:
-1. Crie código Python COMPLETO e FUNCIONAL
-2. Salve em /workspace/roberto/
-3. Inclua README.md com instruções
-4. Liste todos os arquivos criados
-5. Explique como executar
-
-ENTREGA:
-- Código completo
-- README.md
-- Estrutura do projeto
-- Como testar
-
-Seja PROFISSIONAL e COMPLETO.
-
-— Roberto 👷""",
+        description=(
+            f"TAREFA: {tarefa}\n\n"
+            "INSTRUCOES OBRIGATORIAS:\n"
+            "1. CRIE todos os arquivos necessarios usando criar_arquivo\n"
+            "2. TESTE o codigo usando executar_python\n"
+            "3. Se der erro, CORRIJA e teste novamente\n"
+            "4. Entregue o resultado COMPLETO e FUNCIONAL\n"
+            "5. NUNCA de passo-a-passo ou tutorial - FACA o trabalho\n"
+            "6. Liste os arquivos criados no final\n"
+            "Assine: -- Roberto"
+        ),
         agent=roberto,
-        expected_output="Projeto completo"
+        expected_output="Projeto completo com todos os arquivos criados e testados",
     )
-    
     crew = Crew(agents=[roberto], tasks=[task], verbose=False)
-    
     try:
         result = str(crew.kickoff())
-        
-        # Adiciona info sobre GitHub
-        result += f"\n\n📦 **Próximo Passo:**\nUse /github_push para publicar no GitHub!"
-        
-        await send_long_message(update, f"⚙️ Roberto\n\n{result}")
-        
+        await send_long(update, f"👷 Roberto\n\n{result}")
     except Exception as e:
-        await update.message.reply_text(f"❌ {str(e)}")
+        await update.message.reply_text(f"❌ Erro: {str(e)[:500]}")
+
 
 async def cmd_curioso(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("❌ /curioso [sua pesquisa]")
+        await update.message.reply_text("❌ Uso: /curioso [pergunta]\nEx: /curioso tendencias de IA generativa 2026")
         return
-    
-    query = ' '.join(context.args)
-    await update.message.reply_text(f"🔍 Curioso pesquisando: {query}\n\n⏳ Buscando na web...")
-    
-    # FAZ BUSCA REAL
-    search_results = search_tool.search(query, max_results=5)
-    
+    pergunta = " ".join(context.args)
+    await update.message.reply_text(f"🔬 Curioso pesquisando: {pergunta}\n⏳ Buscando na web...")
     task = Task(
-        description=f"""PESQUISA: {query}
-
-RESULTADOS DA WEB:
-{search_results}
-
-INSTRUÇÕES:
-1. Analise os resultados REAIS acima
-2. Sintetize as informações
-3. Forneça dados CONCRETOS
-4. Dê insights práticos
-
-Seja OBJETIVO e baseado em DADOS.
-
-— Curioso 🔬""",
+        description=(
+            f"PESQUISA: {pergunta}\n\n"
+            "INSTRUCOES OBRIGATORIAS:\n"
+            "1. USE buscar_web para pesquisar na internet (faca 2-3 buscas diferentes)\n"
+            "2. USE ler_pagina para acessar as fontes mais relevantes\n"
+            "3. ANALISE criticamente as informacoes\n"
+            "4. Entregue resposta PROFUNDA com:\n"
+            "   - Dados concretos e numeros\n"
+            "   - Fontes citadas\n"
+            "   - Analise critica\n"
+            "   - Conclusoes acionaveis\n"
+            "5. SALVE a pesquisa com salvar_pesquisa se for importante\n"
+            "6. NUNCA responda de forma generica\n"
+            "Assine: -- Curioso"
+        ),
         agent=curioso,
-        expected_output="Análise com dados"
+        expected_output="Analise profunda baseada em dados reais da web com fontes",
     )
-    
     crew = Crew(agents=[curioso], tasks=[task], verbose=False)
-    
     try:
         result = str(crew.kickoff())
-        await send_long_message(update, f"📊 Curioso\n\n{result}")
+        await send_long(update, f"🔬 Curioso\n\n{result}")
     except Exception as e:
-        await update.message.reply_text(f"❌ {str(e)}")
+        await update.message.reply_text(f"❌ Erro: {str(e)[:500]}")
+
 
 async def cmd_marley(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("❌ /marley [descrição visual]")
+        await update.message.reply_text("❌ Uso: /marley [visual]\nEx: /marley crie imagem de tigre robotico")
         return
-    
-    descricao = ' '.join(context.args)
-    await update.message.reply_text(f"🎨 Marley criando: {descricao}\n\n⏳ Gerando imagem...")
-    
+    tarefa = " ".join(context.args)
+    await update.message.reply_text(f"🎨 Marley criando: {tarefa}\n⏳ Gerando...")
     task = Task(
-        description=f"""CRIAR: {descricao}
-
-INSTRUÇÕES:
-1. Crie um prompt DETALHADO em inglês (80-120 palavras)
-2. Otimize para FLUX/Stable Diffusion
-3. Termine com: PROMPT: [seu prompt aqui]
-
-— Marley 🎨""",
+        description=(
+            f"CRIAR: {tarefa}\n\n"
+            "SE FOR PEDIDO DE IMAGEM (OBRIGATORIO):\n"
+            "1. Crie um prompt DETALHADO em INGLES (50-100 palavras)\n"
+            "2. USE a ferramenta gerar_imagem com esse prompt\n"
+            "3. O prompt deve incluir: estilo, iluminacao, cores, composicao\n"
+            "4. A ferramenta retorna IMAGE_GENERATED com url e path\n\n"
+            "SE FOR TEMPLATE/MOCKUP:\n"
+            "1. Crie codigo HTML/SVG completo usando criar_template\n\n"
+            "IMPORTANTE: SEMPRE use as ferramentas. Nao apenas descreva.\n"
+            "Assine: -- Marley"
+        ),
         agent=marley,
-        expected_output="Prompt otimizado"
+        expected_output="Imagem gerada via gerar_imagem ou template criado",
     )
-    
     crew = Crew(agents=[marley], tasks=[task], verbose=False)
-    
     try:
         result = str(crew.kickoff())
-        
-        # Extrai prompt
-        match = re.search(r'PROMPT:\s*(.+?)(?:\n\n|$)', result, re.IGNORECASE | re.DOTALL)
-        if match:
-            prompt = match.group(1).strip()
-            
-            # GERA IMAGEM REAL
-            await update.message.reply_text("⏳ Gerando imagem real (30s)...")
-            
-            image_data, image_url = image_tool.generate(prompt)
-            
-            if image_data:
-                image_data.name = 'marley.jpg'
-                image_data.seek(0)
-                await update.message.reply_photo(photo=image_data, caption=f"🎨 Marley\n\n{descricao}")
-                await update.message.reply_text(f"✅ Imagem gerada!\n\n📋 Prompt usado:\n{prompt[:200]}...")
-            else:
-                await update.message.reply_text(f"⚠️ Erro ao gerar imagem.\n\n📋 Prompt criado:\n{prompt}\n\nUse em: DALL-E, Midjourney")
-        
-        await send_long_message(update, f"🖼️ Marley\n\n{result}")
-        
+        sent = await try_send_image(update, result)
+        clean = result
+        if sent:
+            clean = re.sub(r'IMAGE_GENERATED\s+url=\S+\s+path=\S+\s+size=\d+', '[imagem enviada acima]', clean)
+            clean = re.sub(r'https://gen\.pollinations\.ai/image/[^\s\)\"\'<>]+', '[imagem enviada]', clean)
+            clean = re.sub(r'https://image\.pollinations\.ai/[^\s\)\"\'<>]+', '[imagem enviada]', clean)
+        await send_long(update, f"🎨 Marley\n\n{clean}")
     except Exception as e:
-        await update.message.reply_text(f"❌ {str(e)}")
+        await update.message.reply_text(f"❌ Erro: {str(e)[:500]}")
+
 
 async def cmd_team(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("❌ /team [projeto completo]")
+        await update.message.reply_text("❌ Uso: /team [projeto]\nEx: /team criar landing page fintech")
         return
-    
-    projeto = ' '.join(context.args)
-    await update.message.reply_text(f"👥 Team: {projeto}\n\n⏳ 60-120s...")
-    
-    # ROBERTO: Código
+    projeto = " ".join(context.args)
+    await update.message.reply_text(f"👥 Team no projeto: {projeto}\n⏳ 3 agentes trabalhando...")
+
     task_r = Task(
-        description=f"Roberto: Crie arquitetura técnica para {projeto}. Foque em código Python.",
+        description=(
+            f"PROJETO: {projeto}\n"
+            "Voce e o ENGENHEIRO. Sua parte:\n"
+            "1. Arquitetura tecnica e implementacao\n"
+            "2. Crie os arquivos de codigo usando criar_arquivo\n"
+            "3. Teste o que criou\n"
+            "Assine: -- Roberto"
+        ),
         agent=roberto,
-        expected_output="Arquitetura"
+        expected_output="Parte tecnica implementada",
     )
-    
-    # CURIOSO: Pesquisa
-    await update.message.reply_text("🔍 Curioso pesquisando...")
-    search_results = search_tool.search(projeto, max_results=3)
-    
     task_c = Task(
-        description=f"Curioso: Analise mercado de {projeto}.\n\nDados da web:\n{search_results}",
+        description=(
+            f"PROJETO: {projeto}\n"
+            "Voce e o PESQUISADOR. Sua parte:\n"
+            "1. Use buscar_web para pesquisar mercado e tendencias\n"
+            "2. Forneca dados e insights para embasar o projeto\n"
+            "3. Salve a pesquisa se relevante\n"
+            "Assine: -- Curioso"
+        ),
         agent=curioso,
-        expected_output="Análise"
+        expected_output="Pesquisa de mercado e insights",
     )
-    
-    # MARLEY: Visual
     task_m = Task(
-        description=f"Marley: Crie identidade visual para {projeto}. Faça prompt para logo.",
+        description=(
+            f"PROJETO: {projeto}\n"
+            "Voce e o DIRETOR CRIATIVO. Sua parte:\n"
+            "1. Identidade visual do projeto\n"
+            "2. Use gerar_imagem para criar visual (logo, banner, etc)\n"
+            "3. Use criar_template para mockups HTML se aplicavel\n"
+            "Assine: -- Marley"
+        ),
         agent=marley,
-        expected_output="Design"
+        expected_output="Visual e identidade criativa",
     )
-    
-    crew = Crew(agents=[roberto, curioso, marley], tasks=[task_r, task_c, task_m], verbose=False)
-    
+
+    crew = Crew(
+        agents=[roberto, curioso, marley],
+        tasks=[task_r, task_c, task_m],
+        verbose=False,
+    )
     try:
         result = str(crew.kickoff())
-        await send_long_message(update, f"🎯 Team\n\n{result}")
+        sent = await try_send_image(update, result)
+        clean = result
+        if sent:
+            clean = re.sub(r'IMAGE_GENERATED\s+url=\S+\s+path=\S+\s+size=\d+', '[imagem enviada]', clean)
+            clean = re.sub(r'https://gen\.pollinations\.ai/image/[^\s\)\"\'<>]+', '[imagem enviada]', clean)
+        await send_long(update, f"👥 Team\n\n{clean}")
     except Exception as e:
-        await update.message.reply_text(f"❌ {str(e)}")
+        await update.message.reply_text(f"❌ Erro: {str(e)[:500]}")
+
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    github_status = "✅" if os.getenv("GITHUB_TOKEN") else "❌"
-    replicate_status = "✅" if os.getenv("REPLICATE_API_TOKEN") else "❌"
-    
-    await update.message.reply_text(f"""✅ {datetime.now().strftime('%d/%m %H:%M')}
+    r_files = len([f for f in WS_ROBERTO.rglob("*") if f.is_file() and not f.name.startswith("_")])
+    c_files = len([f for f in WS_CURIOSO.rglob("*") if f.is_file()])
+    m_files = len([f for f in WS_MARLEY.rglob("*") if f.is_file()])
+    await update.message.reply_text(
+        f"✅ IRONCORE AGENTS v3.0 — {datetime.now().strftime('%d/%m %H:%M')}\n\n"
+        f"👷 Roberto — 🟢 Online\n"
+        f"   Workspace: {r_files} arquivo(s)\n"
+        f"   Tools: criar_arquivo, executar_python, executar_bash, ler_arquivo, listar_workspace\n\n"
+        f"🔬 Curioso — 🟢 Online\n"
+        f"   Workspace: {c_files} arquivo(s)\n"
+        f"   Tools: buscar_web, ler_pagina, salvar_pesquisa, listar_pesquisas, ler_pesquisa\n\n"
+        f"🎨 Marley — 🟢 Online\n"
+        f"   Workspace: {m_files} arquivo(s)\n"
+        f"   Tools: gerar_imagem, criar_template, salvar_arquivo, listar_criacoes\n\n"
+        f"🟢 Todos operacionais"
+    )
 
-👷 Roberto - Online
-   GitHub: {github_status}
 
-🔬 Curioso - Online
-   Web Search: ✅
+async def cmd_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = "📁 WORKSPACES\n\n"
+    for name, ws in [("Roberto 👷", WS_ROBERTO), ("Curioso 🔬", WS_CURIOSO), ("Marley 🎨", WS_MARLEY)]:
+        files = [f for f in ws.rglob("*") if f.is_file() and not f.name.startswith("_")]
+        msg += f"{'=' * 30}\n{name}\n"
+        if files:
+            for f in files[:10]:
+                size = f.stat().st_size
+                msg += f"  📄 {f.relative_to(ws)} ({size:,}b)\n"
+            if len(files) > 10:
+                msg += f"  ... +{len(files) - 10} arquivos\n"
+        else:
+            msg += "  (vazio)\n"
+        msg += "\n"
+    await update.message.reply_text(msg)
 
-🎨 Marley - Online
-   Image Gen: {replicate_status}
 
-🟢 Time V2.0 operacional
-""")
+async def cmd_limpar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    count = 0
+    for ws in (WS_ROBERTO, WS_CURIOSO, WS_MARLEY):
+        for f in ws.rglob("*"):
+            if f.is_file():
+                f.unlink()
+                count += 1
+    await update.message.reply_text(f"🗑️ {count} arquivo(s) removido(s) dos workspaces.")
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
-    print("🚀 Time de Agentes V2.0 - AUTÔNOMOS")
-    print(f"📅 {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n")
+    print("=" * 50)
+    print("🚀 IRONCORE AGENTS v3.0")
+    print(f"📅 {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
+    print("=" * 50)
+    print()
+    print(f"👷 Roberto — Engenheiro | Workspace: {WS_ROBERTO}")
+    print(f"   Tools: criar_arquivo, executar_python, executar_bash, ler_arquivo, listar_workspace")
+    print()
+    print(f"🔬 Curioso — Pesquisador | Workspace: {WS_CURIOSO}")
+    print(f"   Tools: buscar_web, ler_pagina, salvar_pesquisa, listar_pesquisas, ler_pesquisa")
+    print()
+    print(f"🎨 Marley — Criativo | Workspace: {WS_MARLEY}")
+    print(f"   Tools: gerar_imagem, criar_template, salvar_arquivo, listar_criacoes")
+    print()
 
-    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not bot_token:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN não configurado")
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    app = Application.builder().token(bot_token).build()
-    
-    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("roberto", cmd_roberto))
     app.add_handler(CommandHandler("curioso", cmd_curioso))
     app.add_handler(CommandHandler("marley", cmd_marley))
     app.add_handler(CommandHandler("team", cmd_team))
     app.add_handler(CommandHandler("status", cmd_status))
-    
-    print("✅ Time V2.0 configurado!")
-    print("⏳ Aguardando no Telegram...\n")
-    
+    app.add_handler(CommandHandler("workspace", cmd_workspace))
+    app.add_handler(CommandHandler("limpar", cmd_limpar))
+
+    print("✅ Bot configurado!")
+    print("⏳ Aguardando comandos no Telegram...\n")
+
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
