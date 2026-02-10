@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-IRONCORE AGENTS v3.0 - Time de Agentes IA para Telegram
+IRONCORE AGENTS v3.2 - Time de Agentes IA para Telegram
 Roberto (Engenheiro) | Curioso (Pesquisador) | Marley (Criativo)
 Cada agente tem workspace proprio e ferramentas reais.
 Deploy: Render.com Background Worker
@@ -268,16 +268,14 @@ class MarleyGenerateImage(BaseTool):
         try:
             encoded = requests.utils.quote(p)
             url = f"https://gen.pollinations.ai/image/{encoded}?width=1024&height=1024&nologo=true&enhance=true"
-            print(f"[MARLEY] Gerando imagem: {url[:120]}...")
+            print(f"[MARLEY] Gerando imagem...")
             resp = requests.get(url, timeout=120, stream=True)
             if resp.status_code == 200:
-                ct = resp.headers.get("content-type", "")
-                # Verifica se retornou imagem de verdade
                 img_data = b""
                 for chunk in resp.iter_content(8192):
                     img_data += chunk
                 if len(img_data) < 500:
-                    return f"ERRO imagem muito pequena ({len(img_data)} bytes), API pode estar indisponivel"
+                    return f"ERRO imagem muito pequena ({len(img_data)} bytes)"
                 img_name = f"img_{datetime.now():%Y%m%d_%H%M%S}.png"
                 img_path = WS_MARLEY / img_name
                 img_path.write_bytes(img_data)
@@ -285,7 +283,7 @@ class MarleyGenerateImage(BaseTool):
                 return f"IMAGE_GENERATED url={url} path={img_path} size={len(img_data)}"
             return f"ERRO HTTP {resp.status_code}"
         except requests.Timeout:
-            return "ERRO timeout na geracao (API lenta, tente novamente)"
+            return "ERRO timeout na geracao (tente novamente)"
         except Exception as e:
             return f"ERRO {e}"
 
@@ -506,7 +504,7 @@ async def try_send_image(update, result_text):
                     with open(local_path, "rb") as f:
                         await update.message.reply_photo(
                             photo=f,
-                            caption="?? Imagem gerada por Marley"
+                            caption="Imagem gerada por Marley"
                         )
                     return True
         except Exception as ex:
@@ -518,14 +516,14 @@ async def try_send_image(update, result_text):
             if resp.status_code == 200 and len(resp.content) > 500:
                 await update.message.reply_photo(
                     photo=BytesIO(resp.content),
-                    caption="?? Imagem gerada por Marley"
+                    caption="Imagem gerada por Marley"
                 )
                 return True
         except Exception as ex:
             print(f"[WARN] Falha envio URL: {ex}")
 
         # Ultimo fallback: link
-        await update.message.reply_text(f"?? Imagem gerada:\n{url}")
+        await update.message.reply_text(f"Imagem gerada:\n{url}")
         return True
 
     # Busca URLs gen.pollinations.ai soltas no texto
@@ -538,12 +536,12 @@ async def try_send_image(update, result_text):
             if resp.status_code == 200 and len(resp.content) > 500:
                 await update.message.reply_photo(
                     photo=BytesIO(resp.content),
-                    caption="?? Imagem gerada por Marley"
+                    caption="Imagem gerada por Marley"
                 )
                 return True
         except Exception:
             pass
-        await update.message.reply_text(f"?? Imagem:\n{url}")
+        await update.message.reply_text(f"Imagem:\n{url}")
         return True
 
     # Verifica se tem arquivo de imagem no workspace do Marley
@@ -552,12 +550,12 @@ async def try_send_image(update, result_text):
         latest = imgs[0]
         if latest.stat().st_size > 500:
             age = (datetime.now() - datetime.fromtimestamp(latest.stat().st_mtime)).seconds
-            if age < 120:  # criada nos ultimos 2 minutos
+            if age < 120:
                 try:
                     with open(latest, "rb") as f:
                         await update.message.reply_photo(
                             photo=f,
-                            caption="?? Imagem gerada por Marley"
+                            caption="Imagem gerada por Marley"
                         )
                     return True
                 except Exception:
@@ -572,22 +570,19 @@ async def try_send_image(update, result_text):
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "?? IRONCORE AGENTS v3.0\n\n"
-        "?? ROBERTO — Engenheiro de Software\n"
-        "   Cria projetos completos, executa codigo, testa e entrega.\n"
-        "   Workspace: /workspace/roberto/\n"
-        "   /roberto [tarefa]\n\n"
-        "?? CURIOSO — Pesquisador & Analista\n"
-        "   Pesquisa na web real, analisa dados, entrega insights.\n"
-        "   Workspace: /workspace/curioso/\n"
-        "   /curioso [pergunta]\n\n"
-        "?? MARLEY — Diretor Criativo & Artista IA\n"
-        "   Gera imagens reais com IA, cria templates e mockups.\n"
-        "   Workspace: /workspace/marley/\n"
-        "   /marley [visual]\n\n"
-        "?? TEAM — Colaboracao Integrada\n"
-        "   Os 3 agentes trabalhando juntos.\n"
-        "   /team [projeto]\n\n"
+        "IRONCORE AGENTS v3.2\n\n"
+        "[ROBERTO] Engenheiro de Software\n"
+        "  Cria projetos completos, executa codigo, testa e entrega.\n"
+        "  /roberto [tarefa]\n\n"
+        "[CURIOSO] Pesquisador & Analista\n"
+        "  Pesquisa na web real, analisa dados, entrega insights.\n"
+        "  /curioso [pergunta]\n\n"
+        "[MARLEY] Diretor Criativo & Artista IA\n"
+        "  Gera imagens reais com IA, cria templates e mockups.\n"
+        "  /marley [visual]\n\n"
+        "[TEAM] Colaboracao Integrada\n"
+        "  Os 3 agentes trabalhando juntos.\n"
+        "  /team [projeto]\n\n"
         "Outros: /status /workspace /limpar\n\n"
         "Exemplos:\n"
         "  /roberto crie uma API Flask com CRUD de usuarios\n"
@@ -599,10 +594,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_roberto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("? Uso: /roberto [tarefa]\nEx: /roberto crie script para analise de CSV")
+        await update.message.reply_text("Uso: /roberto [tarefa]\nEx: /roberto crie script para analise de CSV")
         return
     tarefa = " ".join(context.args)
-    await update.message.reply_text(f"?? Roberto recebeu: {tarefa}\n? Trabalhando...")
+    await update.message.reply_text(f"[Roberto] Recebeu: {tarefa}\nTrabalhando...")
     task = Task(
         description=(
             f"TAREFA: {tarefa}\n\n"
@@ -621,17 +616,17 @@ async def cmd_roberto(update: Update, context: ContextTypes.DEFAULT_TYPE):
     crew = Crew(agents=[roberto], tasks=[task], verbose=False)
     try:
         result = str(crew.kickoff())
-        await send_long(update, f"?? Roberto\n\n{result}")
+        await send_long(update, f"[Roberto]\n\n{result}")
     except Exception as e:
-        await update.message.reply_text(f"? Erro: {str(e)[:500]}")
+        await update.message.reply_text(f"Erro: {str(e)[:500]}")
 
 
 async def cmd_curioso(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("? Uso: /curioso [pergunta]\nEx: /curioso tendencias de IA generativa 2026")
+        await update.message.reply_text("Uso: /curioso [pergunta]\nEx: /curioso tendencias de IA generativa 2026")
         return
     pergunta = " ".join(context.args)
-    await update.message.reply_text(f"?? Curioso pesquisando: {pergunta}\n? Buscando na web...")
+    await update.message.reply_text(f"[Curioso] Pesquisando: {pergunta}\nBuscando na web...")
     task = Task(
         description=(
             f"PESQUISA: {pergunta}\n\n"
@@ -652,17 +647,17 @@ async def cmd_curioso(update: Update, context: ContextTypes.DEFAULT_TYPE):
     crew = Crew(agents=[curioso], tasks=[task], verbose=False)
     try:
         result = str(crew.kickoff())
-        await send_long(update, f"?? Curioso\n\n{result}")
+        await send_long(update, f"[Curioso]\n\n{result}")
     except Exception as e:
-        await update.message.reply_text(f"? Erro: {str(e)[:500]}")
+        await update.message.reply_text(f"Erro: {str(e)[:500]}")
 
 
 async def cmd_marley(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("? Uso: /marley [visual]\nEx: /marley crie imagem de tigre robotico")
+        await update.message.reply_text("Uso: /marley [visual]\nEx: /marley crie imagem de tigre robotico")
         return
     tarefa = " ".join(context.args)
-    await update.message.reply_text(f"?? Marley criando: {tarefa}\n? Gerando...")
+    await update.message.reply_text(f"[Marley] Criando: {tarefa}\nGerando...")
     task = Task(
         description=(
             f"O usuario pediu: {tarefa}\n\n"
@@ -688,17 +683,17 @@ async def cmd_marley(update: Update, context: ContextTypes.DEFAULT_TYPE):
             clean = re.sub(r'IMAGE_GENERATED\s+url=\S+\s+path=\S+\s+size=\d+', '[imagem enviada acima]', clean)
             clean = re.sub(r'https://gen\.pollinations\.ai/image/[^\s\)\"\'<>]+', '[imagem enviada]', clean)
             clean = re.sub(r'https://image\.pollinations\.ai/[^\s\)\"\'<>]+', '[imagem enviada]', clean)
-        await send_long(update, f"?? Marley\n\n{clean}")
+        await send_long(update, f"[Marley]\n\n{clean}")
     except Exception as e:
-        await update.message.reply_text(f"? Erro: {str(e)[:500]}")
+        await update.message.reply_text(f"Erro: {str(e)[:500]}")
 
 
 async def cmd_team(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("? Uso: /team [projeto]\nEx: /team criar landing page fintech")
+        await update.message.reply_text("Uso: /team [projeto]\nEx: /team criar landing page fintech")
         return
     projeto = " ".join(context.args)
-    await update.message.reply_text(f"?? Team no projeto: {projeto}\n? 3 agentes trabalhando...")
+    await update.message.reply_text(f"[Team] Projeto: {projeto}\n3 agentes trabalhando...")
 
     task_r = Task(
         description=(
@@ -749,9 +744,9 @@ async def cmd_team(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if sent:
             clean = re.sub(r'IMAGE_GENERATED\s+url=\S+\s+path=\S+\s+size=\d+', '[imagem enviada]', clean)
             clean = re.sub(r'https://gen\.pollinations\.ai/image/[^\s\)\"\'<>]+', '[imagem enviada]', clean)
-        await send_long(update, f"?? Team\n\n{clean}")
+        await send_long(update, f"[Team]\n\n{clean}")
     except Exception as e:
-        await update.message.reply_text(f"? Erro: {str(e)[:500]}")
+        await update.message.reply_text(f"Erro: {str(e)[:500]}")
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -759,29 +754,29 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     c_files = len([f for f in WS_CURIOSO.rglob("*") if f.is_file()])
     m_files = len([f for f in WS_MARLEY.rglob("*") if f.is_file()])
     await update.message.reply_text(
-        f"? IRONCORE AGENTS v3.0 — {datetime.now().strftime('%d/%m %H:%M')}\n\n"
-        f"?? Roberto — ?? Online\n"
-        f"   Workspace: {r_files} arquivo(s)\n"
-        f"   Tools: criar_arquivo, executar_python, executar_bash, ler_arquivo, listar_workspace\n\n"
-        f"?? Curioso — ?? Online\n"
-        f"   Workspace: {c_files} arquivo(s)\n"
-        f"   Tools: buscar_web, ler_pagina, salvar_pesquisa, listar_pesquisas, ler_pesquisa\n\n"
-        f"?? Marley — ?? Online\n"
-        f"   Workspace: {m_files} arquivo(s)\n"
-        f"   Tools: gerar_imagem, criar_template, salvar_arquivo, listar_criacoes\n\n"
-        f"?? Todos operacionais"
+        f"IRONCORE AGENTS v3.2 - {datetime.now().strftime('%d/%m %H:%M')}\n\n"
+        f"[Roberto] ONLINE\n"
+        f"  Workspace: {r_files} arquivo(s)\n"
+        f"  Tools: criar_arquivo, executar_python, executar_bash, ler_arquivo, listar_workspace\n\n"
+        f"[Curioso] ONLINE\n"
+        f"  Workspace: {c_files} arquivo(s)\n"
+        f"  Tools: buscar_web, ler_pagina, salvar_pesquisa, listar_pesquisas, ler_pesquisa\n\n"
+        f"[Marley] ONLINE\n"
+        f"  Workspace: {m_files} arquivo(s)\n"
+        f"  Tools: gerar_imagem, criar_template, salvar_arquivo, listar_criacoes\n\n"
+        f"Todos operacionais"
     )
 
 
 async def cmd_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = "?? WORKSPACES\n\n"
-    for name, ws in [("Roberto ??", WS_ROBERTO), ("Curioso ??", WS_CURIOSO), ("Marley ??", WS_MARLEY)]:
+    msg = "WORKSPACES\n\n"
+    for name, ws in [("Roberto", WS_ROBERTO), ("Curioso", WS_CURIOSO), ("Marley", WS_MARLEY)]:
         files = [f for f in ws.rglob("*") if f.is_file() and not f.name.startswith("_")]
         msg += f"{'=' * 30}\n{name}\n"
         if files:
             for f in files[:10]:
                 size = f.stat().st_size
-                msg += f"  ?? {f.relative_to(ws)} ({size:,}b)\n"
+                msg += f"  {f.relative_to(ws)} ({size:,}b)\n"
             if len(files) > 10:
                 msg += f"  ... +{len(files) - 10} arquivos\n"
         else:
@@ -797,7 +792,7 @@ async def cmd_limpar(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if f.is_file():
                 f.unlink()
                 count += 1
-    await update.message.reply_text(f"??? {count} arquivo(s) removido(s) dos workspaces.")
+    await update.message.reply_text(f"{count} arquivo(s) removido(s) dos workspaces.")
 
 
 # ============================================================
@@ -806,18 +801,18 @@ async def cmd_limpar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     print("=" * 50)
-    print("?? IRONCORE AGENTS v3.0")
-    print(f"?? {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
+    print("IRONCORE AGENTS v3.2")
+    print(f"{datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
     print("=" * 50)
     print()
-    print(f"?? Roberto — Engenheiro | Workspace: {WS_ROBERTO}")
-    print(f"   Tools: criar_arquivo, executar_python, executar_bash, ler_arquivo, listar_workspace")
+    print(f"Roberto - Engenheiro | Workspace: {WS_ROBERTO}")
+    print(f"  Tools: criar_arquivo, executar_python, executar_bash, ler_arquivo, listar_workspace")
     print()
-    print(f"?? Curioso — Pesquisador | Workspace: {WS_CURIOSO}")
-    print(f"   Tools: buscar_web, ler_pagina, salvar_pesquisa, listar_pesquisas, ler_pesquisa")
+    print(f"Curioso - Pesquisador | Workspace: {WS_CURIOSO}")
+    print(f"  Tools: buscar_web, ler_pagina, salvar_pesquisa, listar_pesquisas, ler_pesquisa")
     print()
-    print(f"?? Marley — Criativo | Workspace: {WS_MARLEY}")
-    print(f"   Tools: gerar_imagem, criar_template, salvar_arquivo, listar_criacoes")
+    print(f"Marley - Criativo | Workspace: {WS_MARLEY}")
+    print(f"  Tools: gerar_imagem, criar_template, salvar_arquivo, listar_criacoes")
     print()
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
@@ -831,8 +826,8 @@ def main():
     app.add_handler(CommandHandler("workspace", cmd_workspace))
     app.add_handler(CommandHandler("limpar", cmd_limpar))
 
-    print("? Bot configurado!")
-    print("? Aguardando comandos no Telegram...\n")
+    print("Bot configurado!")
+    print("Aguardando comandos no Telegram...\n")
 
     app.run_polling()
 
