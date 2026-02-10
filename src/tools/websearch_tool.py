@@ -1,14 +1,22 @@
 ﻿# -*- coding: utf-8 -*-
-from duckduckgo_search import DDGS
+try:
+    from duckduckgo_search import DDGS
+except ImportError:
+    try:
+        from ddgs import DDGS
+    except ImportError:
+        DDGS = None
 
 class WebSearchTool:
     def search(self, query, max_results=5):
-        """Busca na web com DuckDuckGo"""
+        """Busca na web"""
+        if DDGS is None:
+            return f"❌ Módulo de busca não disponível. Query: {query}"
+        
         try:
             results = []
             ddgs = DDGS()
             
-            # Usa text() ao invés de context manager
             search_results = ddgs.text(query, max_results=max_results)
             
             for r in search_results:
@@ -21,8 +29,7 @@ class WebSearchTool:
             if not results:
                 return f"❌ Nenhum resultado encontrado para: {query}"
             
-            # Formata resposta
-            output = f"🔍 **{len(results)} Resultados para:** {query}\n\n"
+            output = f"🔍 **{len(results)} Resultados:** {query}\n\n"
             for i, r in enumerate(results, 1):
                 output += f"**{i}. {r['title']}**\n"
                 output += f"{r['snippet']}...\n"
@@ -31,25 +38,4 @@ class WebSearchTool:
             return output
             
         except Exception as e:
-            return f"❌ Erro na busca: {str(e)}\nQuery: {query}"
-    
-    def scrape_url(self, url):
-        """Extrai texto de uma URL"""
-        try:
-            import requests
-            from bs4 import BeautifulSoup
-            
-            response = requests.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # Remove scripts e styles
-            for script in soup(["script", "style", "nav", "footer"]):
-                script.decompose()
-            
-            text = soup.get_text()
-            lines = (line.strip() for line in text.splitlines())
-            text = ' '.join(line for line in lines if line)
-            
-            return text[:3000]  # Limita tamanho
-        except Exception as e:
-            return f"❌ Erro ao extrair: {str(e)}"
+            return f"❌ Erro: {str(e)}"
