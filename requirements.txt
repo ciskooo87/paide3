@@ -8,3 +8,7 @@ langchain-groq
 langchain
 litellm
 duckduckgo-search
+beautifulsoup4
+requests
+PyGithub
+replicate
