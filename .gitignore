@@ -1,0 +1,12 @@
+config/.env
+.env
+__pycache__/
+*.pyc
+workspace/roberto/_run.py
+workspace/roberto/_temp*
+*.egg-info/
+dist/
+build/
+.venv/
+
+config/CONFIG.ENV
