@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 import os
 import sys
 from datetime import datetime
@@ -9,7 +9,6 @@ import re
 
 # Importa tools
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-from tools.github_tool import GitHubTool
 from tools.websearch_tool import WebSearchTool
 from tools.imagegen_tool import ImageGeneratorTool
 
@@ -18,8 +17,17 @@ llm = LLM(
     api_key=os.getenv("GROQ_API_KEY")
 )
 
+WORKSPACE_BASE = "/workspace"
+AGENT_WORKSPACES = {
+    "roberto": os.path.join(WORKSPACE_BASE, "roberto"),
+    "curioso": os.path.join(WORKSPACE_BASE, "curioso"),
+    "marley": os.path.join(WORKSPACE_BASE, "marley"),
+}
+
+for workspace in AGENT_WORKSPACES.values():
+    os.makedirs(workspace, exist_ok=True)
+
 # Instancia tools
-github_tool = GitHubTool()
 search_tool = WebSearchTool()
 image_tool = ImageGeneratorTool()
 
@@ -30,7 +38,7 @@ image_tool = ImageGeneratorTool()
 roberto = Agent(
     role="Roberto - Autonomous Software Engineer",
     goal="Desenvolver projetos completos, testá-los e publicar no GitHub",
-    backstory="""Sou Roberto, desenvolvedor autônomo de software.
+    backstory=f"""Sou Roberto, desenvolvedor autônomo de software.
 
 MINHAS CAPACIDADES:
 - Criar projetos Python completos do zero
@@ -40,7 +48,7 @@ MINHAS CAPACIDADES:
 - Entregar projetos 100% funcionais
 
 MINHA ÁREA DE TRABALHO:
-/workspace/roberto/ - onde crio e testo tudo
+{AGENT_WORKSPACES['roberto']}/ - onde crio e testo tudo
 
 WORKFLOW:
 1. Entendo o projeto
@@ -69,7 +77,7 @@ FORMATO DE RESPOSTA:
 curioso = Agent(
     role="Curioso - Deep Research Analyst",
     goal="Pesquisar PROFUNDAMENTE na web e fornecer dados reais e insights",
-    backstory="""Sou Curioso, pesquisador com acesso REAL à internet.
+    backstory=f"""Sou Curioso, pesquisador com acesso REAL à internet.
 
 MINHAS CAPACIDADES:
 - Buscar informações ATUAIS na web
@@ -83,6 +91,9 @@ COMO TRABALHO:
 2. Analiso criticamente os dados
 3. Valido informações
 4. Sintetizo insights práticos
+
+MINHA ÁREA DE TRABALHO:
+{AGENT_WORKSPACES['curioso']}/ - onde organizo pesquisas, notas e fontes
 
 NÃO FAÇO:
 ❌ Respostas genéricas sem pesquisa
@@ -104,7 +115,7 @@ FORMATO:
 marley = Agent(
     role="Marley - Creative Visual Generator",
     goal="Criar visuais reais: imagens, mockups, logos, designs",
-    backstory="""Sou Marley, criador visual com IA generativa.
+    backstory=f"""Sou Marley, criador visual com IA generativa.
 
 MINHAS CAPACIDADES:
 - Gerar imagens REAIS com IA
@@ -117,6 +128,9 @@ COMO TRABALHO:
 2. Crio prompt otimizado
 3. Gero a imagem
 4. Entrego o visual pronto
+
+MINHA ÁREA DE TRABALHO:
+{AGENT_WORKSPACES['marley']}/ - onde armazeno prompts e versões visuais
 
 NÃO FAÇO:
 ❌ Só prompts sem imagem
@@ -163,22 +177,24 @@ async def send_long_message(update, text):
             await update.message.reply_text(f"(parte {i+1})\n\n{chunk}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = """🤖 Time de Agentes IA V2.0 - AUTÔNOMOS
+    msg = f"""🤖 Time de Agentes IA V2.0 - AUTÔNOMOS
 
 👷 ROBERTO - Desenvolvedor
    ✓ Cria projetos completos
    ✓ Testa e publica no GitHub
-   ✓ Workspace próprio
+   ✓ Workspace: {AGENT_WORKSPACES['roberto']}
 
 🔬 CURIOSO - Pesquisador
    ✓ Acesso real à internet
    ✓ Pesquisa profunda
    ✓ Dados e insights
+   ✓ Workspace: {AGENT_WORKSPACES['curioso']}
 
 🎨 MARLEY - Criador Visual
    ✓ Gera imagens reais
    ✓ Logos e mockups
    ✓ Material visual
+   ✓ Workspace: {AGENT_WORKSPACES['marley']}
 
 Comandos:
 /roberto [projeto] - Cria e publica
@@ -202,7 +218,7 @@ async def cmd_roberto(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 INSTRUÇÕES:
 1. Crie código Python COMPLETO e FUNCIONAL
-2. Salve em /workspace/roberto/
+2. Salve em {AGENT_WORKSPACES['roberto']}/
 3. Inclua README.md com instruções
 4. Liste todos os arquivos criados
 5. Explique como executar
@@ -250,6 +266,9 @@ async def cmd_curioso(update: Update, context: ContextTypes.DEFAULT_TYPE):
 RESULTADOS DA WEB:
 {search_results}
 
+WORKSPACE DE PESQUISA:
+- Use {AGENT_WORKSPACES['curioso']}/ para organizar notas e fontes durante a análise.
+
 INSTRUÇÕES:
 1. Analise os resultados REAIS acima
 2. Sintetize as informações
@@ -266,7 +285,7 @@ Seja OBJETIVO e baseado em DADOS.
     crew = Crew(agents=[curioso], tasks=[task], verbose=False)
     
     try:
-        result = crew.kickoff()
+        result = str(crew.kickoff())
         await send_long_message(update, f"📊 Curioso\n\n{result}")
     except Exception as e:
         await update.message.reply_text(f"❌ {str(e)}")
@@ -286,6 +305,7 @@ INSTRUÇÕES:
 1. Crie um prompt DETALHADO em inglês (80-120 palavras)
 2. Otimize para FLUX/Stable Diffusion
 3. Termine com: PROMPT: [seu prompt aqui]
+4. Use {AGENT_WORKSPACES['marley']}/ como área de trabalho para rascunhos e variações visuais
 
 — Marley 🎨""",
         agent=marley,
@@ -368,12 +388,15 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 👷 Roberto - Online
    GitHub: {github_status}
+   Workspace: {AGENT_WORKSPACES['roberto']}
 
 🔬 Curioso - Online
    Web Search: ✅
+   Workspace: {AGENT_WORKSPACES['curioso']}
 
 🎨 Marley - Online
    Image Gen: {replicate_status}
+   Workspace: {AGENT_WORKSPACES['marley']}
 
 🟢 Time V2.0 operacional
 """)
@@ -381,8 +404,12 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     print("🚀 Time de Agentes V2.0 - AUTÔNOMOS")
     print(f"📅 {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n")
-    
-    app = Application.builder().token(os.getenv("TELEGRAM_BOT_TOKEN")).build()
+
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not bot_token:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN não configurado")
+
+    app = Application.builder().token(bot_token).build()
     
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("roberto", cmd_roberto))
