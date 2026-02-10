@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 try:
     from duckduckgo_search import DDGS
 except ImportError:
@@ -12,30 +12,33 @@ class WebSearchTool:
         """Busca na web"""
         if DDGS is None:
             return f"❌ Módulo de busca não disponível. Query: {query}"
-        
+
+        query = (query or "").strip()
+        if not query:
+            return "❌ Query de busca vazia"
+
+        safe_max_results = max(1, min(max_results, 10))
+
         try:
             results = []
-            ddgs = DDGS()
-            
-            search_results = ddgs.text(query, max_results=max_results)
-            
-            for r in search_results:
-                results.append({
-                    'title': r.get('title', 'Sem título'),
-                    'snippet': r.get('body', '')[:300],
-                    'url': r.get('href', '')
-                })
-            
+            with DDGS() as ddgs:
+                for result in ddgs.text(query, max_results=safe_max_results):
+                    results.append({
+                        "title": result.get("title", "Sem título"),
+                        "snippet": result.get("body", "")[:300],
+                        "url": result.get("href", ""),
+                    })
+
             if not results:
                 return f"❌ Nenhum resultado encontrado para: {query}"
-            
+
             output = f"🔍 **{len(results)} Resultados:** {query}\n\n"
-            for i, r in enumerate(results, 1):
-                output += f"**{i}. {r['title']}**\n"
-                output += f"{r['snippet']}...\n"
-                output += f"🔗 {r['url']}\n\n"
-            
+            for i, result in enumerate(results, 1):
+                output += f"**{i}. {result['title']}**\n"
+                output += f"{result['snippet']}...\n"
+                output += f"🔗 {result['url']}\n\n"
+
             return output
-            
+
         except Exception as e:
             return f"❌ Erro: {str(e)}"
