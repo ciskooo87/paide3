@@ -120,7 +120,10 @@ def chat_with_tools(system_prompt, user_message, tools_def, tool_executor, max_r
 def web_search(query, max_results=5):
     """Search the web via DuckDuckGo."""
     try:
-        from duckduckgo_search import DDGS
+        try:
+            from ddgs import DDGS
+        except ImportError:
+            from duckduckgo_search import DDGS
         results = []
         with DDGS() as ddgs:
             for r in ddgs.text(query, max_results=max_results):
@@ -158,12 +161,11 @@ def generate_image(prompt):
     """Generate image via Pollinations API. Returns (url, local_path, size) or error string."""
     try:
         encoded = http_requests.utils.quote(prompt)
-        url = (
-            f"https://gen.pollinations.ai/image/{encoded}"
-            f"?width=1024&height=1024&nologo=true&enhance=true"
-        )
-        print(f"[MARLEY] Gerando imagem...")
+        seed = int(datetime.now().timestamp()) % 999999
+        url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&seed={seed}"
+        print(f"[MARLEY] URL: {url[:120]}...")
         resp = http_requests.get(url, timeout=120, stream=True)
+        print(f"[MARLEY] HTTP {resp.status_code}")
         if resp.status_code == 200:
             data = b"".join(resp.iter_content(8192))
             if len(data) < 500:
@@ -173,7 +175,20 @@ def generate_image(prompt):
             fp.write_bytes(data)
             print(f"[MARLEY] Salvo: {fp} ({len(data)} bytes)")
             return (url, str(fp), len(data))
-        return f"ERRO: HTTP {resp.status_code}"
+        # Fallback URL
+        url2 = f"https://pollinations.ai/p/{encoded}"
+        print(f"[MARLEY] Fallback: {url2[:100]}...")
+        resp2 = http_requests.get(url2, timeout=120, stream=True)
+        print(f"[MARLEY] Fallback HTTP {resp2.status_code}")
+        if resp2.status_code == 200:
+            data = b"".join(resp2.iter_content(8192))
+            if len(data) < 500:
+                return f"ERRO: imagem fallback muito pequena"
+            nm = f"img_{datetime.now():%Y%m%d_%H%M%S}.png"
+            fp = WS_MARLEY / nm
+            fp.write_bytes(data)
+            return (url2, str(fp), len(data))
+        return f"ERRO: HTTP {resp.status_code} (primario) e HTTP {resp2.status_code} (fallback)"
     except Exception as e:
         return f"ERRO: {e}"
 
@@ -412,8 +427,22 @@ async def cmd_curioso(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pergunta = " ".join(context.args)
     await update.message.reply_text(f"[Curioso] {pergunta}\nBuscando na web...")
 
+    # Extract search keywords using DeepSeek
+    keywords = chat(
+        system_prompt=(
+            "Extract 2-5 search keywords from the user query. "
+            "Return ONLY the keywords separated by spaces, nothing else. "
+            "Remove filler words like 'me fale sobre', 'o que e', etc. "
+            "Example: 'me fale sobre inteligencia artificial' -> 'inteligencia artificial'"
+        ),
+        user_message=pergunta,
+        max_tokens=50,
+    )
+    search_query = keywords if not keywords.startswith("[ERRO") else pergunta
+    print(f"[CURIOSO] Query: '{pergunta}' -> Keywords: '{search_query}'")
+
     # STEP 1: Search the web (GUARANTEED - Python calls it directly)
-    results = web_search(pergunta)
+    results = web_search(search_query)
 
     # Format results for the LLM
     search_text = ""
