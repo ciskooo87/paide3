@@ -1,39 +1,30 @@
 # -*- coding: utf-8 -*-
 """
-IRONCORE AGENTS v5.0
+IRONCORE AGENTS v6.0
 Roberto (Engenheiro) | Curioso (Pesquisador) | Marley (Criativo)
-LLM: DeepSeek V3 via DeepSeek API
+LLM: DeepSeek V3 via OpenAI-compatible API (NO CrewAI)
+Tools are called DIRECTLY by Python - guaranteed execution.
 Deploy: Render.com Background Worker
 """
 
 import os
 import re
-import sys
-import time
-import logging
+import json
 import subprocess
+import logging
 import warnings
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 
-# ==== SUPPRESS ALL WARNINGS BEFORE IMPORTS ====
-os.environ["LITELLM_LOG"] = "ERROR"
-os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
-os.environ["CREWAI_TRACING_ENABLED"] = "false"
-os.environ["CREWAI_TELEMETRY_OPT_OUT"] = "true"
-os.environ["ANONYMIZED_TELEMETRY"] = "false"
+# Suppress warnings
 warnings.filterwarnings("ignore")
-logging.getLogger("litellm").setLevel(logging.CRITICAL)
-logging.getLogger("LiteLLM").setLevel(logging.CRITICAL)
-logging.getLogger("crewai").setLevel(logging.CRITICAL)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
-import requests
+import requests as http_requests
+from openai import OpenAI
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-from crewai import Agent, Task, Crew, LLM
-from crewai.tools import BaseTool
 
 # ============================================================
 # CONFIG
@@ -50,47 +41,224 @@ WS_MARLEY = BASE_DIR / "workspace" / "marley"
 for d in (WS_ROBERTO, WS_CURIOSO, WS_MARLEY):
     d.mkdir(parents=True, exist_ok=True)
 
-llm = LLM(
-    model="deepseek/deepseek-chat",
+client = OpenAI(
     api_key=DEEPSEEK_API_KEY,
-    temperature=0.3,
+    base_url="https://api.deepseek.com",
 )
 
-MAX_RETRIES = 3
-RETRY_DELAY = 10
-
 
 # ============================================================
-# RETRY WRAPPER
+# LLM HELPER
 # ============================================================
 
-def run_crew_with_retry(crew):
-    for attempt in range(MAX_RETRIES):
+def chat(system_prompt, user_message, max_tokens=4000):
+    """Simple chat completion with DeepSeek V3."""
+    try:
+        resp = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ],
+            max_tokens=max_tokens,
+            temperature=0.3,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        return f"[ERRO LLM] {e}"
+
+
+def chat_with_tools(system_prompt, user_message, tools_def, tool_executor, max_rounds=6):
+    """Chat with function calling loop for Roberto."""
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_message},
+    ]
+
+    for _ in range(max_rounds):
         try:
-            result = crew.kickoff()
-            return str(result)
+            resp = client.chat.completions.create(
+                model="deepseek-chat",
+                messages=messages,
+                tools=tools_def,
+                tool_choice="auto",
+                max_tokens=4000,
+                temperature=0.3,
+            )
         except Exception as e:
-            err = str(e).lower()
-            if "rate_limit" in err or "429" in err or "rate limit" in err:
-                if attempt < MAX_RETRIES - 1:
-                    wait = RETRY_DELAY * (attempt + 1)
-                    print(f"[RETRY] Rate limit. Waiting {wait}s (attempt {attempt+1})")
-                    time.sleep(wait)
-                    continue
-            raise e
-    return "Erro: limite de tentativas excedido"
+            return f"[ERRO LLM] {e}"
+
+        msg = resp.choices[0].message
+
+        # If no tool calls, return the text response
+        if not msg.tool_calls:
+            return msg.content.strip() if msg.content else "(sem resposta)"
+
+        # Execute each tool call
+        messages.append(msg)
+        for tc in msg.tool_calls:
+            fn_name = tc.function.name
+            try:
+                fn_args = json.loads(tc.function.arguments)
+            except json.JSONDecodeError:
+                fn_args = {}
+
+            result = tool_executor(fn_name, fn_args)
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": str(result)[:3000],
+            })
+
+    return messages[-1].get("content", "(max iteracoes atingido)")
 
 
 # ============================================================
-# TOOLS - ROBERTO
+# TOOL IMPLEMENTATIONS
 # ============================================================
 
-class ToolCriarArquivo(BaseTool):
-    name: str = "criar_arquivo"
-    description: str = "Cria arquivo no workspace. Params: filename (str), content (str)"
-    def _run(self, filename: str = "", content: str = "", **kw) -> str:
-        fn = filename or kw.get("file_name", kw.get("name", "output.py"))
-        ct = content or kw.get("code", kw.get("file_content", kw.get("text", "")))
+def web_search(query, max_results=5):
+    """Search the web via DuckDuckGo."""
+    try:
+        from duckduckgo_search import DDGS
+        results = []
+        with DDGS() as ddgs:
+            for r in ddgs.text(query, max_results=max_results):
+                results.append({
+                    "titulo": r["title"],
+                    "resumo": r["body"][:300],
+                    "link": r["href"],
+                })
+        return results if results else [{"erro": f"Nenhum resultado para: {query}"}]
+    except Exception as e:
+        return [{"erro": str(e)}]
+
+
+def fetch_page(url):
+    """Fetch and extract text from a URL."""
+    try:
+        resp = http_requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        from html.parser import HTMLParser
+        class TE(HTMLParser):
+            def __init__(self):
+                super().__init__(); self.parts=[]; self.skip=False
+            def handle_starttag(self, tag, a):
+                if tag in ("script","style","nav","footer","header"): self.skip=True
+            def handle_endtag(self, tag):
+                if tag in ("script","style","nav","footer","header"): self.skip=False
+            def handle_data(self, d):
+                if not self.skip and d.strip(): self.parts.append(d.strip())
+        p = TE(); p.feed(resp.text)
+        return "\n".join(p.parts)[:4000]
+    except Exception as e:
+        return f"ERRO: {e}"
+
+
+def generate_image(prompt):
+    """Generate image via Pollinations API. Returns (url, local_path, size) or error string."""
+    try:
+        encoded = http_requests.utils.quote(prompt)
+        url = (
+            f"https://gen.pollinations.ai/image/{encoded}"
+            f"?width=1024&height=1024&nologo=true&enhance=true"
+        )
+        print(f"[MARLEY] Gerando imagem...")
+        resp = http_requests.get(url, timeout=120, stream=True)
+        if resp.status_code == 200:
+            data = b"".join(resp.iter_content(8192))
+            if len(data) < 500:
+                return f"ERRO: imagem muito pequena ({len(data)} bytes)"
+            nm = f"img_{datetime.now():%Y%m%d_%H%M%S}.png"
+            fp = WS_MARLEY / nm
+            fp.write_bytes(data)
+            print(f"[MARLEY] Salvo: {fp} ({len(data)} bytes)")
+            return (url, str(fp), len(data))
+        return f"ERRO: HTTP {resp.status_code}"
+    except Exception as e:
+        return f"ERRO: {e}"
+
+
+# ============================================================
+# ROBERTO TOOLS (function calling)
+# ============================================================
+
+ROBERTO_TOOLS_DEF = [
+    {
+        "type": "function",
+        "function": {
+            "name": "criar_arquivo",
+            "description": "Cria ou sobrescreve um arquivo no workspace",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filename": {"type": "string", "description": "Nome do arquivo (ex: app.py)"},
+                    "content": {"type": "string", "description": "Conteudo completo do arquivo"},
+                },
+                "required": ["filename", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "executar_python",
+            "description": "Executa codigo Python e retorna o resultado (stdout + stderr)",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string", "description": "Codigo Python completo"},
+                },
+                "required": ["code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "executar_bash",
+            "description": "Executa comando shell (pip install, ls, cat, etc)",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Comando bash"},
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ler_arquivo",
+            "description": "Le conteudo de um arquivo existente no workspace",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filename": {"type": "string", "description": "Nome do arquivo"},
+                },
+                "required": ["filename"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "listar_workspace",
+            "description": "Lista todos os arquivos no workspace",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
+]
+
+
+def roberto_tool_executor(fn_name, fn_args):
+    """Execute Roberto's tools."""
+    if fn_name == "criar_arquivo":
+        fn = fn_args.get("filename", "output.py")
+        ct = fn_args.get("content", "")
         try:
             p = WS_ROBERTO / fn
             p.parent.mkdir(parents=True, exist_ok=True)
@@ -99,51 +267,37 @@ class ToolCriarArquivo(BaseTool):
         except Exception as e:
             return f"ERRO: {e}"
 
-
-class ToolExecutarPython(BaseTool):
-    name: str = "executar_python"
-    description: str = "Executa codigo Python e retorna stdout+stderr. Param: code (str)"
-    def _run(self, code: str = "", **kw) -> str:
-        c = code or kw.get("script", kw.get("python_code", ""))
+    elif fn_name == "executar_python":
+        code = fn_args.get("code", "")
         try:
-            f = WS_ROBERTO / "_run.py"
-            f.write_text(c, encoding="utf-8")
+            tmp = WS_ROBERTO / "_run.py"
+            tmp.write_text(code, encoding="utf-8")
             r = subprocess.run(
-                ["python3", str(f)], capture_output=True,
+                ["python3", str(tmp)], capture_output=True,
                 text=True, timeout=30, cwd=str(WS_ROBERTO)
             )
-            o = (r.stdout + "\n" + r.stderr).strip()
-            return (o or "OK executado sem output")[:3000]
+            out = (r.stdout + "\n" + r.stderr).strip()
+            return (out or "OK executado sem output")[:3000]
         except subprocess.TimeoutExpired:
             return "ERRO: timeout 30s"
         except Exception as e:
             return f"ERRO: {e}"
 
-
-class ToolBash(BaseTool):
-    name: str = "executar_bash"
-    description: str = "Executa comando shell no workspace. Param: command (str)"
-    def _run(self, command: str = "", **kw) -> str:
-        cmd = command or kw.get("cmd", "")
+    elif fn_name == "executar_bash":
+        cmd = fn_args.get("command", "")
         if any(x in cmd for x in ["rm -rf /", "mkfs", ":(){"]):
-            return "ERRO: comando bloqueado"
+            return "ERRO: bloqueado"
         try:
             r = subprocess.run(
                 cmd, shell=True, capture_output=True,
                 text=True, timeout=30, cwd=str(WS_ROBERTO)
             )
             return ((r.stdout + "\n" + r.stderr).strip() or "OK")[:3000]
-        except subprocess.TimeoutExpired:
-            return "ERRO: timeout 30s"
         except Exception as e:
             return f"ERRO: {e}"
 
-
-class ToolLerArquivo(BaseTool):
-    name: str = "ler_arquivo"
-    description: str = "Le conteudo de arquivo do workspace. Param: filename (str)"
-    def _run(self, filename: str = "", **kw) -> str:
-        fn = filename or kw.get("file_name", kw.get("path", ""))
+    elif fn_name == "ler_arquivo":
+        fn = fn_args.get("filename", "")
         try:
             p = WS_ROBERTO / fn
             if not p.exists():
@@ -152,188 +306,13 @@ class ToolLerArquivo(BaseTool):
         except Exception as e:
             return f"ERRO: {e}"
 
-
-class ToolListarWS(BaseTool):
-    name: str = "listar_workspace"
-    description: str = "Lista todos os arquivos no workspace do Roberto"
-    def _run(self, **kw) -> str:
+    elif fn_name == "listar_workspace":
         fs = [f for f in WS_ROBERTO.rglob("*") if f.is_file() and not f.name.startswith("_")]
         if not fs:
             return "Workspace vazio"
-        return "Arquivos:\n" + "\n".join(f"  {f.relative_to(WS_ROBERTO)}" for f in fs[:30])
+        return "\n".join(str(f.relative_to(WS_ROBERTO)) for f in fs[:30])
 
-
-# ============================================================
-# TOOLS - CURIOSO
-# ============================================================
-
-class ToolBuscarWeb(BaseTool):
-    name: str = "buscar_web"
-    description: str = "Pesquisa na internet via DuckDuckGo. Param: query (str). Retorna titulo, resumo e link."
-    def _run(self, query: str = "", **kw) -> str:
-        q = query or kw.get("search_query", kw.get("term", kw.get("search", "")))
-        if not q:
-            return "ERRO: query vazio"
-        try:
-            from duckduckgo_search import DDGS
-            res = []
-            with DDGS() as ddgs:
-                for r in ddgs.text(q, max_results=5):
-                    res.append(
-                        f"TITULO: {r['title']}\n"
-                        f"RESUMO: {r['body'][:300]}\n"
-                        f"LINK: {r['href']}"
-                    )
-            return "\n\n".join(res) if res else f"Nenhum resultado para: {q}"
-        except Exception as e:
-            return f"ERRO: {e}"
-
-
-class ToolLerPagina(BaseTool):
-    name: str = "ler_pagina"
-    description: str = "Acessa URL e extrai texto. Param: url (str com https://)"
-    def _run(self, url: str = "", **kw) -> str:
-        u = url or kw.get("page_url", kw.get("link", ""))
-        if not u:
-            return "ERRO: url vazio"
-        try:
-            r = requests.get(u, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-            from html.parser import HTMLParser
-            class TE(HTMLParser):
-                def __init__(self):
-                    super().__init__(); self.parts=[]; self.skip=False
-                def handle_starttag(self, tag, a):
-                    if tag in ("script","style","nav","footer","header"): self.skip=True
-                def handle_endtag(self, tag):
-                    if tag in ("script","style","nav","footer","header"): self.skip=False
-                def handle_data(self, d):
-                    if not self.skip and d.strip(): self.parts.append(d.strip())
-            p = TE(); p.feed(r.text)
-            text = "\n".join(p.parts)
-            return text[:4000] if text else "Pagina sem conteudo"
-        except Exception as e:
-            return f"ERRO: {e}"
-
-
-class ToolSalvarPesquisa(BaseTool):
-    name: str = "salvar_pesquisa"
-    description: str = "Salva pesquisa em arquivo. Params: filename (str), content (str)"
-    def _run(self, filename: str = "", content: str = "", **kw) -> str:
-        fn = filename or kw.get("file_name", f"pesquisa_{datetime.now():%Y%m%d_%H%M}.md")
-        ct = content or kw.get("text", kw.get("data", ""))
-        try:
-            (WS_CURIOSO / fn).write_text(ct, encoding="utf-8")
-            return f"OK salvo: {fn}"
-        except Exception as e:
-            return f"ERRO: {e}"
-
-
-# ============================================================
-# TOOLS - MARLEY
-# ============================================================
-
-class ToolGerarImagem(BaseTool):
-    name: str = "gerar_imagem"
-    description: str = (
-        "Gera imagem REAL com IA via Pollinations. "
-        "Param: prompt (str em INGLES, 30-100 palavras descrevendo a imagem). "
-        "Retorna IMAGE_GENERATED com url e path."
-    )
-    def _run(self, prompt: str = "", **kw) -> str:
-        p = prompt or kw.get("image_prompt", kw.get("description", kw.get("text", "")))
-        if not p:
-            return "ERRO: prompt vazio"
-        try:
-            encoded = requests.utils.quote(p)
-            url = (
-                f"https://gen.pollinations.ai/image/{encoded}"
-                f"?width=1024&height=1024&nologo=true&enhance=true"
-            )
-            print(f"[MARLEY] Gerando imagem...")
-            resp = requests.get(url, timeout=120, stream=True)
-            if resp.status_code == 200:
-                data = b"".join(resp.iter_content(8192))
-                if len(data) < 500:
-                    return f"ERRO: imagem muito pequena ({len(data)} bytes)"
-                nm = f"img_{datetime.now():%Y%m%d_%H%M%S}.png"
-                fp = WS_MARLEY / nm
-                fp.write_bytes(data)
-                print(f"[MARLEY] Salvo: {fp} ({len(data)} bytes)")
-                return f"IMAGE_GENERATED url={url} path={fp} size={len(data)}"
-            return f"ERRO: HTTP {resp.status_code}"
-        except requests.Timeout:
-            return "ERRO: timeout 120s"
-        except Exception as e:
-            return f"ERRO: {e}"
-
-
-class ToolCriarTemplate(BaseTool):
-    name: str = "criar_template"
-    description: str = "Cria template HTML/SVG. Params: filename (str), content (str)"
-    def _run(self, filename: str = "", content: str = "", **kw) -> str:
-        fn = filename or kw.get("file_name", "template.html")
-        ct = content or kw.get("code", kw.get("html_content", kw.get("html", "")))
-        try:
-            (WS_MARLEY / fn).write_text(ct, encoding="utf-8")
-            return f"OK template: {fn}"
-        except Exception as e:
-            return f"ERRO: {e}"
-
-
-# ============================================================
-# AGENTES
-# ============================================================
-
-roberto = Agent(
-    role="Roberto - Senior Software Engineer",
-    goal=(
-        "Entregar projetos de software COMPLETOS e FUNCIONAIS. "
-        "NUNCA dar passo-a-passo ou tutorial. "
-        "SEMPRE usar criar_arquivo para criar cada arquivo. "
-        "SEMPRE usar executar_python para testar."
-    ),
-    backstory=(
-        "Sou Roberto, engenheiro senior com 15 anos de experiencia. "
-        "Meu metodo: recebo tarefa, crio TODOS os arquivos com criar_arquivo, "
-        "testo com executar_python, corrijo bugs, entrego PRONTO. "
-        "Nunca dou instrucoes - eu FACO o trabalho."
-    ),
-    llm=llm, verbose=False, allow_delegation=False, max_iter=8,
-    tools=[ToolCriarArquivo(), ToolExecutarPython(), ToolBash(),
-           ToolLerArquivo(), ToolListarWS()],
-)
-
-curioso = Agent(
-    role="Curioso - Research Analyst",
-    goal=(
-        "Pesquisar na internet usando buscar_web e entregar "
-        "APENAS dados reais com links. PROIBIDO inventar."
-    ),
-    backstory=(
-        "Sou Curioso, analista com acesso a internet. "
-        "REGRA: SEMPRE chamo buscar_web ANTES de responder. "
-        "NUNCA invento dados. Se nao encontro, digo claramente. "
-        "Processo: buscar_web > ler resultados > responder com fontes."
-    ),
-    llm=llm, verbose=False, allow_delegation=False, max_iter=6,
-    tools=[ToolBuscarWeb(), ToolLerPagina(), ToolSalvarPesquisa()],
-)
-
-marley = Agent(
-    role="Marley - AI Image Artist",
-    goal=(
-        "GERAR imagens reais usando gerar_imagem. "
-        "NUNCA apenas descrever. Prompt em INGLES."
-    ),
-    backstory=(
-        "Sou Marley, artista IA. Quando pedem imagem, "
-        "SEMPRE uso gerar_imagem com prompt detalhado em INGLES. "
-        "Incluo: subject, style, lighting, colors, mood. "
-        "NUNCA respondo sem gerar a imagem."
-    ),
-    llm=llm, verbose=False, allow_delegation=False, max_iter=4,
-    tools=[ToolGerarImagem(), ToolCriarTemplate()],
-)
+    return f"ERRO: ferramenta desconhecida: {fn_name}"
 
 
 # ============================================================
@@ -372,201 +351,232 @@ async def send_long(update, text):
             pass
 
 
-def clean_thinking(text):
-    cleaned = re.sub(r'<think>.*?</think>', '', str(text), flags=re.DOTALL).strip()
-    return cleaned if cleaned else str(text).strip()
-
-
-async def try_send_image(update, text):
-    text = str(text)
-    m = re.search(r'IMAGE_GENERATED\s+url=(\S+)\s+path=(\S+)', text)
-    if m:
-        url, lp = m.group(1), m.group(2)
+async def send_image(update, url=None, local_path=None):
+    """Send image to Telegram chat."""
+    # Try local file
+    if local_path:
         try:
-            if os.path.exists(lp) and os.path.getsize(lp) > 500:
-                with open(lp, "rb") as f:
+            if os.path.exists(local_path) and os.path.getsize(local_path) > 500:
+                with open(local_path, "rb") as f:
                     await update.message.reply_photo(photo=f, caption="Imagem por Marley")
                 return True
         except Exception:
             pass
+
+    # Try URL
+    if url:
         try:
-            r = requests.get(url, timeout=90)
-            if r.status_code == 200 and len(r.content) > 500:
-                await update.message.reply_photo(photo=BytesIO(r.content), caption="Imagem por Marley")
+            resp = http_requests.get(url, timeout=90)
+            if resp.status_code == 200 and len(resp.content) > 500:
+                await update.message.reply_photo(
+                    photo=BytesIO(resp.content), caption="Imagem por Marley"
+                )
                 return True
         except Exception:
             pass
         await update.message.reply_text(f"Imagem gerada:\n{url}")
         return True
 
-    urls = re.findall(r'https://gen\.pollinations\.ai/image/[^\s\)\"\'<>]+', text)
-    for u in urls[:1]:
-        try:
-            r = requests.get(u, timeout=90)
-            if r.status_code == 200 and len(r.content) > 500:
-                await update.message.reply_photo(photo=BytesIO(r.content), caption="Imagem por Marley")
-                return True
-        except Exception:
-            pass
-        await update.message.reply_text(f"Imagem:\n{u}")
-        return True
-
-    imgs = sorted(WS_MARLEY.glob("img_*.png"), reverse=True)
-    if imgs and imgs[0].stat().st_size > 500:
-        age = (datetime.now() - datetime.fromtimestamp(imgs[0].stat().st_mtime)).seconds
-        if age < 180:
-            try:
-                with open(imgs[0], "rb") as f:
-                    await update.message.reply_photo(photo=f, caption="Imagem por Marley")
-                return True
-            except Exception:
-                pass
     return False
 
 
-def clean_image_refs(text):
-    text = re.sub(r'IMAGE_GENERATED\s+url=\S+\s+path=\S+(\s+size=\d+)?', '[imagem enviada]', text)
-    text = re.sub(r'https://gen\.pollinations\.ai/image/[^\s\)\"\'<>]+', '', text)
-    return text.strip()
-
-
 # ============================================================
-# COMANDOS
+# BOT COMMANDS
 # ============================================================
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "=== IRONCORE AGENTS v5.0 ===\n"
+        "=== IRONCORE AGENTS v6.0 ===\n"
         "LLM: DeepSeek V3\n\n"
         "[ROBERTO] Engenheiro de Software\n"
+        "  Cria projetos completos com codigo real.\n"
         "  /roberto [tarefa]\n\n"
         "[CURIOSO] Pesquisador & Analista\n"
+        "  Pesquisa na web real com fontes.\n"
         "  /curioso [pergunta]\n\n"
         "[MARLEY] Artista IA\n"
+        "  Gera imagens reais com IA.\n"
         "  /marley [descricao]\n\n"
         "[TEAM] 3 agentes juntos\n"
         "  /team [projeto]\n\n"
-        "Outros: /status  /workspace  /limpar\n\n"
-        "Exemplos:\n"
-        "  /roberto crie API Flask com CRUD\n"
-        "  /curioso tendencias IA 2026\n"
-        "  /marley dragao cyberpunk\n"
-        "  /team landing page fintech"
+        "Outros: /status  /workspace  /limpar"
     )
-
-
-async def cmd_roberto(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("/roberto [tarefa]")
-        return
-    tarefa = " ".join(context.args)
-    await update.message.reply_text(f"[Roberto] {tarefa}\nTrabalhando...")
-    task = Task(
-        description=(
-            f"TAREFA: {tarefa}\n\n"
-            "OBRIGATORIO:\n"
-            "1. Use criar_arquivo para criar cada arquivo\n"
-            "2. Use executar_python para testar\n"
-            "3. Corrija erros se houver\n"
-            "4. Entregue COMPLETO\n"
-            "5. NUNCA de passo-a-passo\n"
-            "6. Liste arquivos criados no final"
-        ),
-        agent=roberto,
-        expected_output="Projeto completo com arquivos criados e testados",
-    )
-    try:
-        result = clean_thinking(run_crew_with_retry(
-            Crew(agents=[roberto], tasks=[task], verbose=False)))
-        await send_long(update, f"[Roberto]\n\n{result}")
-    except Exception as e:
-        print(f"[ERRO] Roberto: {e}")
-        await update.message.reply_text(f"[Roberto] Erro: {str(e)[:400]}")
 
 
 async def cmd_curioso(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Curioso: ALWAYS searches the web first, then summarizes."""
     if not context.args:
         await update.message.reply_text("/curioso [pergunta]")
         return
+
     pergunta = " ".join(context.args)
-    await update.message.reply_text(f"[Curioso] {pergunta}\nBuscando...")
-    task = Task(
-        description=(
-            f"PESQUISE: {pergunta}\n\n"
-            "OBRIGATORIO:\n"
-            "1. Chame buscar_web com termos relevantes\n"
-            "2. Leia os resultados\n"
-            "3. Use ler_pagina se precisar mais detalhes\n"
-            "4. Responda SOMENTE com dados da busca\n"
-            "5. Cite fontes com links\n"
-            "PROIBIDO responder sem buscar_web.\n"
-            "PROIBIDO inventar dados."
+    await update.message.reply_text(f"[Curioso] {pergunta}\nBuscando na web...")
+
+    # STEP 1: Search the web (GUARANTEED - Python calls it directly)
+    results = web_search(pergunta)
+
+    # Format results for the LLM
+    search_text = ""
+    for i, r in enumerate(results, 1):
+        if "erro" in r:
+            search_text += f"\n{r['erro']}"
+        else:
+            search_text += (
+                f"\n--- Resultado {i} ---\n"
+                f"Titulo: {r['titulo']}\n"
+                f"Resumo: {r['resumo']}\n"
+                f"Link: {r['link']}\n"
+            )
+
+    # STEP 2: Ask DeepSeek to summarize the REAL search results
+    summary = chat(
+        system_prompt=(
+            "Voce e Curioso, analista de pesquisa. "
+            "Responda a pergunta do usuario SOMENTE com base nos resultados de busca abaixo. "
+            "Cite as fontes com links. "
+            "Se os resultados nao responderem a pergunta, diga isso claramente. "
+            "NUNCA invente informacoes que nao estejam nos resultados."
         ),
-        agent=curioso,
-        expected_output="Dados reais da web com fontes",
+        user_message=(
+            f"PERGUNTA: {pergunta}\n\n"
+            f"RESULTADOS DA BUSCA WEB:\n{search_text}\n\n"
+            f"Responda baseado SOMENTE nesses resultados. Cite fontes."
+        ),
     )
-    try:
-        result = clean_thinking(run_crew_with_retry(
-            Crew(agents=[curioso], tasks=[task], verbose=False)))
-        await send_long(update, f"[Curioso]\n\n{result}")
-    except Exception as e:
-        print(f"[ERRO] Curioso: {e}")
-        await update.message.reply_text(f"[Curioso] Erro: {str(e)[:400]}")
+
+    await send_long(update, f"[Curioso]\n\n{summary}")
 
 
 async def cmd_marley(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Marley: ALWAYS generates real images."""
     if not context.args:
         await update.message.reply_text("/marley [descricao]")
         return
+
     pedido = " ".join(context.args)
-    await update.message.reply_text(f"[Marley] {pedido}\nGerando...")
-    task = Task(
-        description=(
-            f"IMAGEM PEDIDA: {pedido}\n\n"
-            "OBRIGATORIO:\n"
-            "1. Crie prompt em INGLES (50-100 palavras)\n"
-            "2. Chame gerar_imagem com o prompt\n"
-            "3. Reporte resultado\n"
-            "PROIBIDO responder sem gerar_imagem."
+    await update.message.reply_text(f"[Marley] {pedido}\nGerando imagem...")
+
+    # STEP 1: Ask DeepSeek to create an optimized English prompt
+    prompt_en = chat(
+        system_prompt=(
+            "You are an AI image prompt engineer. "
+            "Create a detailed image generation prompt in ENGLISH (50-100 words). "
+            "Include: subject, art style, lighting, colors, composition, mood, quality keywords. "
+            "Add 'highly detailed, professional quality, 8k' at the end. "
+            "Return ONLY the prompt text, nothing else."
         ),
-        agent=marley,
-        expected_output="IMAGE_GENERATED com url e path",
+        user_message=f"Create image prompt for: {pedido}",
+        max_tokens=300,
     )
-    try:
-        result = clean_thinking(run_crew_with_retry(
-            Crew(agents=[marley], tasks=[task], verbose=False)))
-        sent = await try_send_image(update, result)
-        display = clean_image_refs(result) if sent else result
-        if display.strip():
-            await send_long(update, f"[Marley]\n\n{display}")
-    except Exception as e:
-        print(f"[ERRO] Marley: {e}")
-        await update.message.reply_text(f"[Marley] Erro: {str(e)[:400]}")
+
+    if prompt_en.startswith("[ERRO"):
+        await update.message.reply_text(f"[Marley] Erro ao criar prompt: {prompt_en}")
+        return
+
+    print(f"[MARLEY] Prompt: {prompt_en[:100]}...")
+
+    # STEP 2: Generate the image (GUARANTEED - Python calls Pollinations directly)
+    result = generate_image(prompt_en)
+
+    if isinstance(result, tuple):
+        url, local_path, size = result
+        sent = await send_image(update, url=url, local_path=local_path)
+        if sent:
+            await update.message.reply_text(
+                f"[Marley]\n\nImagem gerada com sucesso ({size:,} bytes).\n"
+                f"Prompt: {prompt_en[:200]}"
+            )
+        else:
+            await update.message.reply_text(f"[Marley] Imagem gerada mas falha no envio.\nLink: {url}")
+    else:
+        await update.message.reply_text(f"[Marley] {result}")
+
+
+async def cmd_roberto(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Roberto: Creates code using function calling with DeepSeek."""
+    if not context.args:
+        await update.message.reply_text("/roberto [tarefa]")
+        return
+
+    tarefa = " ".join(context.args)
+    await update.message.reply_text(f"[Roberto] {tarefa}\nTrabalhando...")
+
+    result = chat_with_tools(
+        system_prompt=(
+            "Voce e Roberto, engenheiro de software senior. "
+            "Voce DEVE usar as ferramentas disponiveis para completar a tarefa. "
+            "Processo: 1) Crie os arquivos com criar_arquivo, "
+            "2) Teste com executar_python, 3) Corrija erros, 4) Entregue pronto. "
+            "NUNCA de passo-a-passo. Voce CRIA os arquivos e EXECUTA o codigo. "
+            "No final, liste os arquivos criados."
+        ),
+        user_message=f"TAREFA: {tarefa}",
+        tools_def=ROBERTO_TOOLS_DEF,
+        tool_executor=roberto_tool_executor,
+        max_rounds=8,
+    )
+
+    await send_long(update, f"[Roberto]\n\n{result}")
 
 
 async def cmd_team(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Team: All 3 agents work on the project."""
     if not context.args:
         await update.message.reply_text("/team [projeto]")
         return
+
     projeto = " ".join(context.args)
-    await update.message.reply_text(f"[Team] {projeto}\n3 agentes...")
-    tasks = [
-        Task(description=f"PROJETO: {projeto}\nVoce e ENGENHEIRO. Crie codigo com criar_arquivo e teste.",
-             agent=roberto, expected_output="Codigo criado e testado"),
-        Task(description=f"PROJETO: {projeto}\nVoce e PESQUISADOR. Use buscar_web. Dados reais com fontes.",
-             agent=curioso, expected_output="Pesquisa com fontes"),
-        Task(description=f"PROJETO: {projeto}\nVoce e CRIATIVO. Use gerar_imagem para visual.",
-             agent=marley, expected_output="Imagem gerada"),
-    ]
-    try:
-        result = clean_thinking(run_crew_with_retry(
-            Crew(agents=[roberto, curioso, marley], tasks=tasks, verbose=False)))
-        sent = await try_send_image(update, result)
-        display = clean_image_refs(result) if sent else result
-        await send_long(update, f"[Team]\n\n{display}")
-    except Exception as e:
-        print(f"[ERRO] Team: {e}")
-        await update.message.reply_text(f"[Team] Erro: {str(e)[:400]}")
+    await update.message.reply_text(f"[Team] {projeto}\nPesquisando, codando e criando visual...")
+
+    # STEP 1: Curioso pesquisa
+    results = web_search(projeto)
+    search_text = ""
+    for r in results:
+        if "erro" not in r:
+            search_text += f"- {r['titulo']}: {r['resumo'][:150]} ({r['link']})\n"
+
+    pesquisa = chat(
+        system_prompt="Voce e um pesquisador. Resuma os resultados da busca web de forma util para um projeto.",
+        user_message=f"PROJETO: {projeto}\n\nRESULTADOS:\n{search_text}",
+        max_tokens=1500,
+    )
+
+    # STEP 2: Roberto coda
+    codigo = chat_with_tools(
+        system_prompt=(
+            "Voce e Roberto, engenheiro senior. "
+            "Use as ferramentas para criar o codigo do projeto. "
+            "Crie arquivos com criar_arquivo e teste com executar_python."
+        ),
+        user_message=f"PROJETO: {projeto}\nPESQUISA DE MERCADO:\n{pesquisa[:1000]}",
+        tools_def=ROBERTO_TOOLS_DEF,
+        tool_executor=roberto_tool_executor,
+        max_rounds=6,
+    )
+
+    # STEP 3: Marley cria visual
+    prompt_en = chat(
+        system_prompt=(
+            "You are an image prompt engineer. "
+            "Create a prompt in English (50-80 words) for a visual related to this project. "
+            "Return ONLY the prompt."
+        ),
+        user_message=f"Project: {projeto}",
+        max_tokens=200,
+    )
+
+    img_result = generate_image(prompt_en)
+    if isinstance(img_result, tuple):
+        url, lp, sz = img_result
+        await send_image(update, url=url, local_path=lp)
+
+    # Send combined results
+    full_result = (
+        f"=== PESQUISA (Curioso) ===\n{pesquisa}\n\n"
+        f"=== CODIGO (Roberto) ===\n{codigo}\n\n"
+        f"=== VISUAL (Marley) ===\nImagem gerada."
+    )
+    await send_long(update, f"[Team]\n\n{full_result}")
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -574,8 +584,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cc = len([f for f in WS_CURIOSO.rglob("*") if f.is_file()])
     mc = len([f for f in WS_MARLEY.rglob("*") if f.is_file()])
     await update.message.reply_text(
-        f"=== IRONCORE AGENTS v5.0 ===\n"
-        f"LLM: DeepSeek V3\n"
+        f"=== IRONCORE AGENTS v6.0 ===\n"
+        f"LLM: DeepSeek V3 (direto, sem CrewAI)\n"
         f"{datetime.now():%d/%m/%Y %H:%M}\n\n"
         f"[Roberto] ONLINE - {rc} arquivo(s)\n"
         f"[Curioso] ONLINE - {cc} arquivo(s)\n"
@@ -618,8 +628,8 @@ async def error_handler(update, context):
 
 def main():
     print("=" * 50)
-    print("IRONCORE AGENTS v5.0")
-    print("LLM: DeepSeek V3")
+    print("IRONCORE AGENTS v6.0")
+    print("LLM: DeepSeek V3 (direto, sem CrewAI)")
     print(f"{datetime.now():%d/%m/%Y %H:%M:%S}")
     print("=" * 50)
     print(f"\n[Roberto]  {WS_ROBERTO}")
