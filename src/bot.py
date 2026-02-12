@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-IRONCORE AGENTS v8.0
-Roberto | Curioso | Marley + Vida + Noticias + Email + Reddit + LinkedIn
+IRONCORE AGENTS v9.0 - IRIS
+Agente mestre com linguagem natural + modo noturno de reflexao.
+Sem necessidade de comandos com barra.
 LLM: DeepSeek V3 via OpenAI-compatible API
 Deploy: Render.com Background Worker
 """
@@ -13,7 +14,7 @@ import subprocess
 import logging
 import warnings
 import imaplib
-import email
+import email as email_lib
 from email.header import decode_header
 from datetime import datetime, timedelta, timezone, time as dt_time
 from io import BytesIO
@@ -25,7 +26,10 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 import requests as http_requests
 from openai import OpenAI
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, CallbackContext
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    ContextTypes, CallbackContext, filters,
+)
 
 # ============================================================
 # CONFIG
@@ -34,18 +38,13 @@ from telegram.ext import Application, CommandHandler, ContextTypes, CallbackCont
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-
-# Gmail IMAP
 GMAIL_EMAIL = os.getenv("GMAIL_EMAIL", "")
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")
-
-# Corporate email (optional)
 CORP_EMAIL = os.getenv("CORP_EMAIL", "")
 CORP_PASSWORD = os.getenv("CORP_PASSWORD", "")
 CORP_IMAP_SERVER = os.getenv("CORP_IMAP_SERVER", "")
 
 BRT = timezone(timedelta(hours=-3))
-
 BASE_DIR = Path(__file__).resolve().parent.parent
 WS_ROBERTO = BASE_DIR / "workspace" / "roberto"
 WS_CURIOSO = BASE_DIR / "workspace" / "curioso"
@@ -81,10 +80,34 @@ def week_key():
 
 
 # ============================================================
+# CONVERSATION HISTORY
+# ============================================================
+
+MAX_HISTORY = 30
+
+def get_history():
+    data = load_data("historico")
+    return data.get("mensagens", [])
+
+def add_to_history(role, content):
+    data = load_data("historico")
+    if "mensagens" not in data:
+        data["mensagens"] = []
+    data["mensagens"].append({
+        "role": role,
+        "content": content[:1000],
+        "time": now_str(),
+    })
+    # Keep last N
+    data["mensagens"] = data["mensagens"][-MAX_HISTORY:]
+    save_data("historico", data)
+
+
+# ============================================================
 # LLM
 # ============================================================
 
-def chat(system_prompt, user_message, max_tokens=4000):
+def chat_simple(system_prompt, user_message, max_tokens=4000):
     try:
         r = client.chat.completions.create(
             model="deepseek-chat",
@@ -94,38 +117,16 @@ def chat(system_prompt, user_message, max_tokens=4000):
             ], max_tokens=max_tokens, temperature=0.3)
         return r.choices[0].message.content.strip()
     except Exception as e:
-        return f"[ERRO LLM] {e}"
-
-def chat_with_tools(system_prompt, user_message, tools_def, tool_executor, max_rounds=6):
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_message},
-    ]
-    for _ in range(max_rounds):
-        try:
-            r = client.chat.completions.create(
-                model="deepseek-chat", messages=messages,
-                tools=tools_def, tool_choice="auto",
-                max_tokens=4000, temperature=0.3)
-        except Exception as e:
-            return f"[ERRO LLM] {e}"
-        msg = r.choices[0].message
-        if not msg.tool_calls:
-            return msg.content.strip() if msg.content else "(sem resposta)"
-        messages.append(msg)
-        for tc in msg.tool_calls:
-            try: fn_args = json.loads(tc.function.arguments)
-            except: fn_args = {}
-            result = tool_executor(tc.function.name, fn_args)
-            messages.append({"role": "tool", "tool_call_id": tc.id, "content": str(result)[:3000]})
-    return "(max iteracoes)"
+        return f"[ERRO] {e}"
 
 
 # ============================================================
-# TOOLS
+# CAPABILITY FUNCTIONS (all bot features as callable functions)
 # ============================================================
 
-def web_search(query, max_results=5):
+# --- WEB SEARCH ---
+
+def fn_web_search(query, max_results=5):
     try:
         try:
             from ddgs import DDGS
@@ -134,13 +135,13 @@ def web_search(query, max_results=5):
         results = []
         with DDGS() as ddgs:
             for r in ddgs.text(query, max_results=max_results):
-                results.append({"titulo": r["title"], "resumo": r["body"][:300], "link": r["href"]})
-        return results if results else [{"erro": f"Nenhum resultado: {query}"}]
+                results.append(f"- {r['title']}: {r['body'][:200]} ({r['href']})")
+        return "\n".join(results) if results else f"Nenhum resultado para: {query}"
     except Exception as e:
-        return [{"erro": str(e)}]
+        return f"ERRO busca: {e}"
 
-def web_search_news(query, max_results=5):
-    """Search specifically for news articles."""
+
+def fn_web_news(query, max_results=5):
     try:
         try:
             from ddgs import DDGS
@@ -149,86 +150,28 @@ def web_search_news(query, max_results=5):
         results = []
         with DDGS() as ddgs:
             for r in ddgs.news(query, max_results=max_results):
-                results.append({
-                    "titulo": r.get("title", ""),
-                    "resumo": r.get("body", "")[:300],
-                    "link": r.get("url", r.get("href", "")),
-                    "fonte": r.get("source", ""),
-                    "data": r.get("date", ""),
-                })
-        return results if results else [{"erro": f"Nenhuma noticia: {query}"}]
+                results.append(
+                    f"- [{r.get('source','')}] {r.get('title','')}: "
+                    f"{r.get('body','')[:200]} ({r.get('url', r.get('href',''))})")
+        return "\n".join(results) if results else f"Nenhuma noticia: {query}"
     except Exception as e:
-        return [{"erro": str(e)}]
-
-def fetch_page(url):
-    try:
-        resp = http_requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-        from html.parser import HTMLParser
-        class TE(HTMLParser):
-            def __init__(self):
-                super().__init__(); self.parts=[]; self.skip=False
-            def handle_starttag(self, tag, a):
-                if tag in ("script","style","nav","footer","header"): self.skip=True
-            def handle_endtag(self, tag):
-                if tag in ("script","style","nav","footer","header"): self.skip=False
-            def handle_data(self, d):
-                if not self.skip and d.strip(): self.parts.append(d.strip())
-        p = TE(); p.feed(resp.text)
-        return "\n".join(p.parts)[:4000]
-    except Exception as e:
-        return f"ERRO: {e}"
-
-def generate_image(prompt):
-    try:
-        encoded = http_requests.utils.quote(prompt)
-        seed = int(datetime.now().timestamp()) % 999999
-        url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&seed={seed}"
-        print(f"[MARLEY] URL: {url[:120]}...")
-        resp = http_requests.get(url, timeout=120, stream=True)
-        print(f"[MARLEY] HTTP {resp.status_code}")
-        if resp.status_code == 200:
-            data = b"".join(resp.iter_content(8192))
-            if len(data) < 500:
-                return f"ERRO: imagem pequena ({len(data)}b)"
-            nm = f"img_{datetime.now():%Y%m%d_%H%M%S}.png"
-            fp = WS_MARLEY / nm; fp.write_bytes(data)
-            return (url, str(fp), len(data))
-        url2 = f"https://pollinations.ai/p/{encoded}"
-        resp2 = http_requests.get(url2, timeout=120, stream=True)
-        if resp2.status_code == 200:
-            data = b"".join(resp2.iter_content(8192))
-            if len(data) >= 500:
-                fp = WS_MARLEY / f"img_{datetime.now():%Y%m%d_%H%M%S}.png"
-                fp.write_bytes(data)
-                return (url2, str(fp), len(data))
-        return f"ERRO: HTTP {resp.status_code} / {resp2.status_code}"
-    except Exception as e:
-        return f"ERRO: {e}"
+        return f"ERRO noticias: {e}"
 
 
-# ============================================================
-# EMAIL READER
-# ============================================================
+# --- EMAIL ---
 
 def decode_mime_header(raw):
-    """Decode MIME encoded header to string."""
-    if not raw:
-        return ""
+    if not raw: return ""
     parts = decode_header(raw)
     decoded = []
     for part, charset in parts:
         if isinstance(part, bytes):
-            try:
-                decoded.append(part.decode(charset or "utf-8", errors="replace"))
-            except Exception:
-                decoded.append(part.decode("utf-8", errors="replace"))
-        else:
-            decoded.append(str(part))
+            try: decoded.append(part.decode(charset or "utf-8", errors="replace"))
+            except: decoded.append(part.decode("utf-8", errors="replace"))
+        else: decoded.append(str(part))
     return " ".join(decoded)
 
-
 def get_email_body(msg):
-    """Extract text body from email message."""
     body = ""
     if msg.is_multipart():
         for part in msg.walk():
@@ -236,812 +179,225 @@ def get_email_body(msg):
             if ct == "text/plain":
                 try:
                     payload = part.get_payload(decode=True)
-                    charset = part.get_content_charset() or "utf-8"
-                    body = payload.decode(charset, errors="replace")
+                    body = payload.decode(part.get_content_charset() or "utf-8", errors="replace")
                     break
-                except Exception:
-                    pass
+                except: pass
             elif ct == "text/html" and not body:
                 try:
                     payload = part.get_payload(decode=True)
-                    charset = part.get_content_charset() or "utf-8"
-                    html = payload.decode(charset, errors="replace")
-                    body = re.sub(r'<[^>]+>', ' ', html)
-                    body = re.sub(r'\s+', ' ', body).strip()
-                except Exception:
-                    pass
+                    html = payload.decode(part.get_content_charset() or "utf-8", errors="replace")
+                    body = re.sub(r'<[^>]+>', ' ', html); body = re.sub(r'\s+', ' ', body).strip()
+                except: pass
     else:
         try:
             payload = msg.get_payload(decode=True)
-            charset = msg.get_content_charset() or "utf-8"
-            body = payload.decode(charset, errors="replace")
-        except Exception:
-            body = str(msg.get_payload())
-    return body[:2000]
+            body = payload.decode(msg.get_content_charset() or "utf-8", errors="replace")
+        except: body = str(msg.get_payload())
+    return body[:1500]
 
 
-def read_emails(email_addr, password, imap_server="imap.gmail.com", n=5, folder="INBOX"):
-    """Read last N emails via IMAP. Returns list of dicts."""
-    emails = []
-    try:
-        mail = imaplib.IMAP4_SSL(imap_server)
-        mail.login(email_addr, password)
-        mail.select(folder, readonly=True)
-
-        _, data = mail.search(None, "ALL")
-        ids = data[0].split()
-        if not ids:
-            mail.logout()
-            return [{"erro": "Caixa de entrada vazia"}]
-
-        # Get last N
-        recent_ids = ids[-n:]
-        recent_ids.reverse()
-
-        for eid in recent_ids:
-            _, msg_data = mail.fetch(eid, "(RFC822)")
-            raw = msg_data[0][1]
-            msg = email.message_from_bytes(raw)
-
-            de = decode_mime_header(msg.get("From", ""))
-            assunto = decode_mime_header(msg.get("Subject", "(sem assunto)"))
-            data_email = msg.get("Date", "")
-            body = get_email_body(msg)
-
-            emails.append({
-                "de": de[:100],
-                "assunto": assunto[:200],
-                "data": data_email[:30],
-                "corpo": body[:500],
-            })
-
-        mail.logout()
-    except imaplib.IMAP4.error as e:
-        return [{"erro": f"Erro IMAP: {e}"}]
-    except Exception as e:
-        return [{"erro": f"Erro: {e}"}]
-
-    return emails if emails else [{"erro": "Nenhum email encontrado"}]
-
-
-# ============================================================
-# REDDIT READER
-# ============================================================
-
-def fetch_reddit(subreddit="technology", sort="hot", limit=10):
-    """Fetch top posts from a subreddit using public JSON API."""
-    try:
-        url = f"https://www.reddit.com/r/{subreddit}/{sort}.json?limit={limit}"
-        headers = {"User-Agent": "IRONCORE-Agent/1.0"}
-        resp = http_requests.get(url, headers=headers, timeout=15)
-        if resp.status_code != 200:
-            return [{"erro": f"Reddit HTTP {resp.status_code}"}]
-
-        data = resp.json()
-        posts = []
-        for child in data.get("data", {}).get("children", []):
-            p = child.get("data", {})
-            posts.append({
-                "titulo": p.get("title", "")[:200],
-                "score": p.get("score", 0),
-                "comments": p.get("num_comments", 0),
-                "url": f"https://reddit.com{p.get('permalink', '')}",
-                "selftext": p.get("selftext", "")[:300],
-                "author": p.get("author", ""),
-            })
-        return posts if posts else [{"erro": "Nenhum post encontrado"}]
-    except Exception as e:
-        return [{"erro": str(e)}]
-
-
-# ============================================================
-# ROBERTO TOOLS
-# ============================================================
-
-ROBERTO_TOOLS_DEF = [
-    {"type": "function", "function": {"name": "criar_arquivo",
-        "description": "Cria arquivo no workspace",
-        "parameters": {"type": "object", "properties": {
-            "filename": {"type": "string"}, "content": {"type": "string"}},
-            "required": ["filename", "content"]}}},
-    {"type": "function", "function": {"name": "executar_python",
-        "description": "Executa codigo Python",
-        "parameters": {"type": "object", "properties": {
-            "code": {"type": "string"}}, "required": ["code"]}}},
-    {"type": "function", "function": {"name": "executar_bash",
-        "description": "Executa comando shell",
-        "parameters": {"type": "object", "properties": {
-            "command": {"type": "string"}}, "required": ["command"]}}},
-    {"type": "function", "function": {"name": "ler_arquivo",
-        "description": "Le arquivo do workspace",
-        "parameters": {"type": "object", "properties": {
-            "filename": {"type": "string"}}, "required": ["filename"]}}},
-    {"type": "function", "function": {"name": "listar_workspace",
-        "description": "Lista arquivos",
-        "parameters": {"type": "object", "properties": {}}}},
-]
-
-def roberto_tool_executor(fn_name, fn_args):
-    if fn_name == "criar_arquivo":
-        fn, ct = fn_args.get("filename", "out.py"), fn_args.get("content", "")
-        try:
-            p = WS_ROBERTO / fn; p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(ct, encoding="utf-8"); return f"OK: {fn} ({len(ct)}b)"
-        except Exception as e: return f"ERRO: {e}"
-    elif fn_name == "executar_python":
-        code = fn_args.get("code", "")
-        try:
-            tmp = WS_ROBERTO / "_run.py"; tmp.write_text(code, encoding="utf-8")
-            r = subprocess.run(["python3", str(tmp)], capture_output=True, text=True,
-                timeout=30, cwd=str(WS_ROBERTO))
-            return ((r.stdout + "\n" + r.stderr).strip() or "OK")[:3000]
-        except subprocess.TimeoutExpired: return "ERRO: timeout"
-        except Exception as e: return f"ERRO: {e}"
-    elif fn_name == "executar_bash":
-        cmd = fn_args.get("command", "")
-        if any(x in cmd for x in ["rm -rf /", "mkfs", ":(){ "]): return "ERRO: bloqueado"
-        try:
-            r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
-                timeout=30, cwd=str(WS_ROBERTO))
-            return ((r.stdout + "\n" + r.stderr).strip() or "OK")[:3000]
-        except Exception as e: return f"ERRO: {e}"
-    elif fn_name == "ler_arquivo":
-        fn = fn_args.get("filename", "")
-        try:
-            p = WS_ROBERTO / fn
-            if not p.exists(): return f"ERRO: nao encontrado: {fn}"
-            return p.read_text(encoding="utf-8")[:4000]
-        except Exception as e: return f"ERRO: {e}"
-    elif fn_name == "listar_workspace":
-        fs = [f for f in WS_ROBERTO.rglob("*") if f.is_file() and not f.name.startswith("_")]
-        return "\n".join(str(f.relative_to(WS_ROBERTO)) for f in fs[:30]) if fs else "Vazio"
-    return f"ERRO: desconhecido: {fn_name}"
-
-
-# ============================================================
-# TELEGRAM HELPERS
-# ============================================================
-
-def split_msg(text, max_len=4000):
-    text = str(text).strip()
-    if not text: return ["(sem resposta)"]
-    if len(text) <= max_len: return [text]
-    chunks, cur = [], ""
-    for par in text.split("\n\n"):
-        if len(cur) + len(par) + 2 <= max_len:
-            cur += par + "\n\n"
-        else:
-            if cur.strip(): chunks.append(cur.strip())
-            if len(par) > max_len:
-                for i in range(0, len(par), max_len): chunks.append(par[i:i+max_len])
-                cur = ""
-            else: cur = par + "\n\n"
-    if cur.strip(): chunks.append(cur.strip())
-    return chunks if chunks else [text[:max_len]]
-
-async def send_long(update, text):
-    for i, chunk in enumerate(split_msg(text)):
-        try:
-            pref = f"(parte {i+1})\n\n" if i > 0 else ""
-            await update.message.reply_text(pref + chunk)
-        except: pass
-
-async def send_image(update, url=None, local_path=None):
-    if local_path:
-        try:
-            if os.path.exists(local_path) and os.path.getsize(local_path) > 500:
-                with open(local_path, "rb") as f:
-                    await update.message.reply_photo(photo=f, caption="Imagem por Marley")
-                return True
-        except: pass
-    if url:
-        try:
-            resp = http_requests.get(url, timeout=90)
-            if resp.status_code == 200 and len(resp.content) > 500:
-                await update.message.reply_photo(photo=BytesIO(resp.content), caption="Imagem por Marley")
-                return True
-        except: pass
-        await update.message.reply_text(f"Imagem:\n{url}"); return True
-    return False
-
-
-# ============================================================
-# AGENT COMMANDS
-# ============================================================
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "=== IRONCORE AGENTS v8.0 ===\n"
-        "Assistente Pessoal Completo\n\n"
-        "--- AGENTES ---\n"
-        "/roberto [tarefa]\n"
-        "/curioso [pergunta]\n"
-        "/marley [descricao]\n"
-        "/team [projeto]\n\n"
-        "--- INFORMACAO ---\n"
-        "/noticias [categoria]\n"
-        "/email [n] - Ultimos emails\n"
-        "/reddit [subreddit]\n"
-        "/linkedin [tema]\n"
-        "/briefing - Resumo matinal completo\n\n"
-        "--- PRODUTIVIDADE ---\n"
-        "/diario /foco /pausa\n"
-        "/tarefa /tarefas /feito\n"
-        "/meta /metas /review\n\n"
-        "--- SAUDE ---\n"
-        "/treino /humor\n\n"
-        "--- GERAL ---\n"
-        "/dash /status /lembretes\n"
-        "/workspace /limpar\n\n"
-        "Dica: /briefing pela manha, /review no fim de semana"
-    )
-
-
-async def cmd_roberto(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("/roberto [tarefa]"); return
-    tarefa = " ".join(context.args)
-    await update.message.reply_text(f"[Roberto] {tarefa}\nTrabalhando...")
-    result = chat_with_tools(
-        "Voce e Roberto, engenheiro senior. Use ferramentas para criar e testar codigo. NUNCA de passo-a-passo.",
-        f"TAREFA: {tarefa}", ROBERTO_TOOLS_DEF, roberto_tool_executor, 8)
-    await send_long(update, f"[Roberto]\n\n{result}")
-
-
-async def cmd_curioso(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("/curioso [pergunta]"); return
-    pergunta = " ".join(context.args)
-    await update.message.reply_text(f"[Curioso] {pergunta}\nBuscando...")
-    kw = chat("Extract 2-5 search keywords. Return ONLY keywords.", pergunta, 50)
-    sq = kw if not kw.startswith("[ERRO") else pergunta
-    results = web_search(sq)
-    stxt = ""
-    for i, r in enumerate(results, 1):
-        if "erro" in r: stxt += f"\n{r['erro']}"
-        else: stxt += f"\n{i}. {r['titulo']}\n{r['resumo']}\n{r['link']}\n"
-    summary = chat("Responda SOMENTE com dados da busca. Cite fontes. NUNCA invente.",
-        f"PERGUNTA: {pergunta}\n\nRESULTADOS:\n{stxt}")
-    await send_long(update, f"[Curioso]\n\n{summary}")
-
-
-async def cmd_marley(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("/marley [descricao]"); return
-    pedido = " ".join(context.args)
-    await update.message.reply_text(f"[Marley] {pedido}\nGerando...")
-    prompt_en = chat(
-        "Create detailed image prompt in ENGLISH (50-100 words). Subject, style, lighting. "
-        "Add 'highly detailed, 8k'. Return ONLY the prompt.",
-        f"Create image prompt for: {pedido}", 300)
-    if prompt_en.startswith("[ERRO"): await update.message.reply_text(f"[Marley] {prompt_en}"); return
-    result = generate_image(prompt_en)
-    if isinstance(result, tuple):
-        sent = await send_image(update, url=result[0], local_path=result[1])
-        if sent: await update.message.reply_text(f"[Marley] ({result[2]:,} bytes)")
-    else: await update.message.reply_text(f"[Marley] {result}")
-
-
-async def cmd_team(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("/team [projeto]"); return
-    projeto = " ".join(context.args)
-    await update.message.reply_text(f"[Team] {projeto}\n3 agentes...")
-    results = web_search(projeto)
-    stxt = "".join(f"- {r['titulo']}: {r['resumo'][:150]}\n" for r in results if "erro" not in r)
-    pesquisa = chat("Resuma os resultados para um projeto.", f"PROJETO: {projeto}\n{stxt}", 1500)
-    codigo = chat_with_tools("Voce e Roberto. Crie codigo com ferramentas.",
-        f"PROJETO: {projeto}\nPESQUISA:\n{pesquisa[:1000]}", ROBERTO_TOOLS_DEF, roberto_tool_executor, 6)
-    prompt_en = chat("Create image prompt in English (50 words). Return ONLY prompt.", f"Project: {projeto}", 200)
-    img = generate_image(prompt_en)
-    if isinstance(img, tuple): await send_image(update, url=img[0], local_path=img[1])
-    await send_long(update, f"[Team]\n\n=== PESQUISA ===\n{pesquisa}\n\n=== CODIGO ===\n{codigo}")
-
-
-# ============================================================
-# NEWS
-# ============================================================
-
-NEWS_CATEGORIES = {
-    "brasil": ["Brasil economia politica hoje", "Brasil noticias principais hoje"],
-    "tech": ["inteligencia artificial novidades 2026", "tecnologia noticias hoje"],
-    "mundo": ["world news today", "noticias internacionais hoje"],
-    "ia": ["AI artificial intelligence breakthroughs 2026", "LLM GPT Claude DeepSeek news"],
-}
-
-async def cmd_noticias(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cats = context.args if context.args else ["brasil", "tech", "mundo"]
-
-    valid_cats = []
-    for c in cats:
-        c_lower = c.lower()
-        if c_lower in NEWS_CATEGORIES:
-            valid_cats.append(c_lower)
-        else:
-            valid_cats.append("brasil")
-
-    await update.message.reply_text(
-        f"[Noticias] Buscando: {', '.join(valid_cats)}...")
-
-    all_news = []
-    for cat in valid_cats:
-        queries = NEWS_CATEGORIES.get(cat, NEWS_CATEGORIES["brasil"])
-        for q in queries:
-            results = web_search_news(q, max_results=5)
-            for r in results:
-                if "erro" not in r:
-                    r["categoria"] = cat
-                    all_news.append(r)
-
-    if not all_news:
-        await update.message.reply_text("Nenhuma noticia encontrada.")
-        return
-
-    # Format for AI summary
-    news_text = ""
-    for i, n in enumerate(all_news[:20], 1):
-        news_text += (
-            f"\n[{n['categoria'].upper()}] {n['titulo']}\n"
-            f"Fonte: {n.get('fonte', 'N/A')} | {n.get('data', '')}\n"
-            f"{n['resumo']}\n{n['link']}\n"
-        )
-
-    summary = chat(
-        system_prompt=(
-            "Voce e um editor de noticias. Crie um BRIEFING conciso em portugues. "
-            "Organize por categoria (BRASIL, TECH, MUNDO, IA). "
-            "Para cada noticia: titulo + 1-2 frases de resumo + fonte. "
-            "Maximo 5 noticias por categoria. "
-            "No final, uma frase com o destaque do dia."
-        ),
-        user_message=f"Noticias coletadas:\n{news_text}\n\nCrie o briefing.",
-        max_tokens=3000,
-    )
-
-    # Save
-    data = load_data("noticias")
-    data[today_str()] = {"hora": now_str(), "categorias": valid_cats, "resumo": summary[:2000]}
-    save_data("noticias", data)
-
-    await send_long(update, f"[Noticias {today_str()}]\n\n{summary}")
-
-
-# ============================================================
-# EMAIL
-# ============================================================
-
-async def cmd_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args or []
-
-    # Determine which account and how many
-    conta = "gmail"
-    n = 5
-    for a in args:
-        if a.lower() in ("corp", "corporativo", "trabalho", "brasforma"):
-            conta = "corp"
-        else:
-            try: n = int(a)
-            except: pass
-
-    n = min(max(n, 1), 20)
-
+def fn_read_emails(conta="gmail", n=5):
     if conta == "gmail":
         if not GMAIL_EMAIL or not GMAIL_APP_PASSWORD:
-            await update.message.reply_text(
-                "Gmail nao configurado.\n\n"
-                "Configure no Render (Environment):\n"
-                "GMAIL_EMAIL = seu@gmail.com\n"
-                "GMAIL_APP_PASSWORD = senha de app\n\n"
-                "Para gerar App Password:\n"
-                "1. myaccount.google.com/security\n"
-                "2. Verificacao em 2 etapas (ativar)\n"
-                "3. Senhas de app > gerar nova\n"
-                "4. Copie a senha de 16 caracteres")
-            return
-        email_addr = GMAIL_EMAIL
-        password = GMAIL_APP_PASSWORD
-        server = "imap.gmail.com"
+            return "Gmail nao configurado. Configure GMAIL_EMAIL e GMAIL_APP_PASSWORD no Render."
+        addr, pwd, srv = GMAIL_EMAIL, GMAIL_APP_PASSWORD, "imap.gmail.com"
     else:
         if not CORP_EMAIL or not CORP_PASSWORD:
-            await update.message.reply_text(
-                "Email corporativo nao configurado.\n\n"
-                "Configure no Render:\n"
-                "CORP_EMAIL = seu@empresa.com\n"
-                "CORP_PASSWORD = senha\n"
-                "CORP_IMAP_SERVER = imap.servidor.com")
-            return
-        email_addr = CORP_EMAIL
-        password = CORP_PASSWORD
-        server = CORP_IMAP_SERVER or "imap.gmail.com"
-
-    await update.message.reply_text(f"[Email] Lendo {n} emails de {conta}...")
-
-    emails = read_emails(email_addr, password, server, n)
-
-    if emails and "erro" in emails[0]:
-        await update.message.reply_text(f"[Email] {emails[0]['erro']}")
-        return
-
-    # Format for AI summary
-    email_text = ""
-    for i, e in enumerate(emails, 1):
-        email_text += (
-            f"\n--- Email {i} ---\n"
-            f"De: {e['de']}\n"
-            f"Assunto: {e['assunto']}\n"
-            f"Data: {e['data']}\n"
-            f"Corpo: {e['corpo'][:300]}\n"
-        )
-
-    summary = chat(
-        system_prompt=(
-            "Voce e um assistente de email. Resuma os emails recebidos em portugues. "
-            "Para cada email: remetente, assunto, resumo em 1-2 frases, e se requer acao. "
-            "No final, liste os que precisam de resposta urgente. "
-            "Seja conciso e pratico."
-        ),
-        user_message=f"Emails recebidos ({conta}):\n{email_text}\n\nResuma de forma pratica.",
-        max_tokens=2000,
-    )
-
-    await send_long(update, f"[Email - {conta.upper()}]\n\n{summary}")
+            return "Email corporativo nao configurado."
+        addr, pwd, srv = CORP_EMAIL, CORP_PASSWORD, CORP_IMAP_SERVER or "imap.gmail.com"
+    try:
+        mail = imaplib.IMAP4_SSL(srv)
+        mail.login(addr, pwd)
+        mail.select("INBOX", readonly=True)
+        _, data = mail.search(None, "ALL")
+        ids = data[0].split()
+        if not ids: mail.logout(); return "Caixa vazia."
+        results = []
+        for eid in list(reversed(ids[-n:])):
+            _, msg_data = mail.fetch(eid, "(RFC822)")
+            msg = email_lib.message_from_bytes(msg_data[0][1])
+            results.append(
+                f"De: {decode_mime_header(msg.get('From',''))[:80]}\n"
+                f"Assunto: {decode_mime_header(msg.get('Subject',''))[:120]}\n"
+                f"Data: {msg.get('Date','')[:25]}\n"
+                f"Corpo: {get_email_body(msg)[:300]}\n")
+        mail.logout()
+        return "\n---\n".join(results) if results else "Nenhum email."
+    except Exception as e:
+        return f"ERRO email: {e}"
 
 
-# ============================================================
-# REDDIT
-# ============================================================
+# --- REDDIT ---
 
-REDDIT_DEFAULTS = {
-    "tech": "technology",
-    "ia": "artificial",
-    "python": "Python",
-    "brasil": "brasil",
-    "news": "worldnews",
-    "dev": "programming",
-    "startup": "startups",
-    "finance": "finance",
-}
-
-async def cmd_reddit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args or ["tech"]
-    sub = args[0].lower()
-
-    # Map aliases
-    subreddit = REDDIT_DEFAULTS.get(sub, sub)
-
-    await update.message.reply_text(f"[Reddit] r/{subreddit} ...")
-
-    posts = fetch_reddit(subreddit, "hot", 10)
-
-    if posts and "erro" in posts[0]:
-        await update.message.reply_text(f"[Reddit] {posts[0]['erro']}")
-        return
-
-    # Format
-    posts_text = ""
-    for i, p in enumerate(posts[:10], 1):
-        posts_text += (
-            f"\n{i}. [{p['score']} pts, {p['comments']} comments] {p['titulo']}\n"
-            f"   {p['selftext'][:150]}\n"
-            f"   {p['url']}\n"
-        )
-
-    summary = chat(
-        system_prompt=(
-            "Voce e um curador de conteudo do Reddit. "
-            "Resuma os posts mais relevantes em portugues. "
-            "Para cada post relevante: titulo traduzido + por que importa em 1 frase. "
-            "Destaque os 3 mais importantes. Ignore posts irrelevantes ou memes."
-        ),
-        user_message=f"Posts de r/{subreddit}:\n{posts_text}\n\nResuma os destaques.",
-        max_tokens=2000,
-    )
-
-    await send_long(update, f"[Reddit - r/{subreddit}]\n\n{summary}")
+def fn_reddit(subreddit="technology", limit=8):
+    aliases = {"tech": "technology", "ia": "artificial", "brasil": "brasil",
+        "news": "worldnews", "dev": "programming", "python": "Python",
+        "startup": "startups", "finance": "finance"}
+    sub = aliases.get(subreddit.lower(), subreddit)
+    try:
+        url = f"https://www.reddit.com/r/{sub}/hot.json?limit={limit}"
+        resp = http_requests.get(url, headers={"User-Agent": "IRONCORE/1.0"}, timeout=15)
+        if resp.status_code != 200: return f"Reddit HTTP {resp.status_code}"
+        posts = []
+        for c in resp.json().get("data", {}).get("children", []):
+            p = c.get("data", {})
+            posts.append(f"[{p.get('score',0)} pts] {p.get('title','')[:150]}")
+        return "\n".join(posts) if posts else "Nenhum post."
+    except Exception as e:
+        return f"ERRO reddit: {e}"
 
 
-# ============================================================
-# LINKEDIN (via web search)
-# ============================================================
+# --- IMAGE ---
 
-async def cmd_linkedin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    tema = " ".join(context.args) if context.args else "business trends technology"
-    await update.message.reply_text(f"[LinkedIn] Buscando tendencias: {tema}...")
-
-    # Search for LinkedIn-style content
-    results1 = web_search(f"LinkedIn trending {tema} 2026", 5)
-    results2 = web_search(f"{tema} industry insights trends", 5)
-
-    all_results = results1 + results2
-    rtxt = ""
-    for r in all_results:
-        if "erro" not in r:
-            rtxt += f"- {r['titulo']}: {r['resumo'][:200]}\n{r['link']}\n\n"
-
-    if not rtxt:
-        await update.message.reply_text("[LinkedIn] Nenhum resultado encontrado.")
-        return
-
-    summary = chat(
-        system_prompt=(
-            "Voce e um analista de tendencias profissionais (estilo LinkedIn). "
-            "Com base nos resultados de busca, crie um resumo de tendencias. "
-            "Formato: 3-5 tendencias/insights com explicacao breve. "
-            "Tom profissional, relevante para executivos e empreendedores. "
-            "Responda em portugues."
-        ),
-        user_message=f"Tema: {tema}\n\nResultados:\n{rtxt}\n\nCrie o resumo de tendencias.",
-        max_tokens=2000,
-    )
-
-    await send_long(update, f"[LinkedIn Trends - {tema}]\n\n{summary}")
+def fn_generate_image(prompt):
+    try:
+        encoded = http_requests.utils.quote(prompt)
+        seed = int(datetime.now().timestamp()) % 999999
+        url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&seed={seed}"
+        resp = http_requests.get(url, timeout=120, stream=True)
+        if resp.status_code == 200:
+            data = b"".join(resp.iter_content(8192))
+            if len(data) < 500: return None, f"Imagem muito pequena"
+            fp = WS_MARLEY / f"img_{datetime.now():%Y%m%d_%H%M%S}.png"
+            fp.write_bytes(data)
+            return str(fp), url
+        url2 = f"https://pollinations.ai/p/{encoded}"
+        resp2 = http_requests.get(url2, timeout=120, stream=True)
+        if resp2.status_code == 200:
+            data = b"".join(resp2.iter_content(8192))
+            if len(data) >= 500:
+                fp = WS_MARLEY / f"img_{datetime.now():%Y%m%d_%H%M%S}.png"
+                fp.write_bytes(data)
+                return str(fp), url2
+        return None, f"HTTP {resp.status_code}"
+    except Exception as e:
+        return None, f"ERRO: {e}"
 
 
-# ============================================================
-# MORNING BRIEFING
-# ============================================================
+# --- ROBERTO (code) ---
 
-async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("[Briefing] Preparando seu resumo matinal...")
+def fn_create_file(filename, content):
+    try:
+        p = WS_ROBERTO / filename; p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8"); return f"OK: {filename} ({len(content)}b)"
+    except Exception as e: return f"ERRO: {e}"
 
-    parts = []
+def fn_run_python(code):
+    try:
+        tmp = WS_ROBERTO / "_run.py"; tmp.write_text(code, encoding="utf-8")
+        r = subprocess.run(["python3", str(tmp)], capture_output=True, text=True,
+            timeout=30, cwd=str(WS_ROBERTO))
+        return ((r.stdout + "\n" + r.stderr).strip() or "OK")[:3000]
+    except subprocess.TimeoutExpired: return "ERRO: timeout"
+    except Exception as e: return f"ERRO: {e}"
 
-    # 1. NEWS
-    all_news = []
-    for cat in ["brasil", "tech", "mundo"]:
-        for q in NEWS_CATEGORIES[cat]:
-            for r in web_search_news(q, 3):
-                if "erro" not in r:
-                    r["cat"] = cat
-                    all_news.append(r)
+def fn_run_bash(command):
+    if any(x in command for x in ["rm -rf /", "mkfs", ":(){ "]): return "Bloqueado"
+    try:
+        r = subprocess.run(command, shell=True, capture_output=True, text=True,
+            timeout=30, cwd=str(WS_ROBERTO))
+        return ((r.stdout + "\n" + r.stderr).strip() or "OK")[:3000]
+    except Exception as e: return f"ERRO: {e}"
 
-    news_txt = ""
-    for n in all_news[:15]:
-        news_txt += f"[{n['cat'].upper()}] {n['titulo']} - {n['resumo'][:100]}\n"
+def fn_read_file(filename):
+    try:
+        p = WS_ROBERTO / filename
+        if not p.exists(): return f"Nao encontrado: {filename}"
+        return p.read_text(encoding="utf-8")[:4000]
+    except Exception as e: return f"ERRO: {e}"
 
-    # 2. REDDIT top posts
-    reddit_txt = ""
-    for sub in ["technology", "worldnews"]:
-        posts = fetch_reddit(sub, "hot", 5)
-        for p in posts[:5]:
-            if "erro" not in p:
-                reddit_txt += f"[r/{sub}] {p['titulo']} ({p['score']} pts)\n"
-
-    # 3. EMAILS (if configured)
-    email_txt = ""
-    if GMAIL_EMAIL and GMAIL_APP_PASSWORD:
-        emails = read_emails(GMAIL_EMAIL, GMAIL_APP_PASSWORD, "imap.gmail.com", 5)
-        for e in emails:
-            if "erro" not in e:
-                email_txt += f"De: {e['de'][:30]} | {e['assunto'][:80]}\n"
-
-    # 4. TASKS
-    tarefas = load_data("tarefas")
-    pendentes = [t for t in tarefas.get("items", []) if not t["feita"]]
-    task_txt = "\n".join(f"#{t['id']} {t['texto']}" for t in pendentes[:10])
-
-    # 5. WEEKLY GOALS
-    metas_data = load_data("metas")
-    metas = metas_data.get(week_key(), [])
-    meta_txt = "\n".join(f"[{'OK' if m['concluida'] else '...'}] {m['texto']}" for m in metas)
-
-    # 6. MOOD/ENERGY yesterday
-    humor = load_data("humor")
-    ontem = (datetime.now(BRT) - timedelta(days=1)).strftime("%Y-%m-%d")
-    humor_txt = ""
-    for h in humor.get(ontem, []):
-        humor_txt += f"{h['nivel']}/5 {h.get('nota', '')}\n"
-
-    # Compile and send to AI
-    full_context = (
-        f"=== NOTICIAS ===\n{news_txt}\n\n"
-        f"=== REDDIT ===\n{reddit_txt}\n\n"
-        f"=== EMAILS NAO LIDOS ===\n{email_txt or '(nao configurado)'}\n\n"
-        f"=== TAREFAS PENDENTES ===\n{task_txt or 'Nenhuma'}\n\n"
-        f"=== METAS DA SEMANA ===\n{meta_txt or 'Nenhuma'}\n\n"
-        f"=== HUMOR ONTEM ===\n{humor_txt or 'Nao registrado'}\n"
-    )
-
-    briefing = chat(
-        system_prompt=(
-            "Voce e um assistente pessoal criando o BRIEFING MATINAL. "
-            "Estruture assim:\n"
-            "1. BOM DIA + data + frase motivacional curta\n"
-            "2. TOP 5 NOTICIAS (1 frase cada, mais importante primeiro)\n"
-            "3. REDDIT DESTAQUE (2-3 posts relevantes)\n"
-            "4. EMAILS (resumo se houver, destaque urgentes)\n"
-            "5. TAREFAS DO DIA (liste pendentes)\n"
-            "6. METAS DA SEMANA (progresso)\n"
-            "7. FRASE DO DIA (inspiracional, curta)\n"
-            "Seja conciso, pratico, energizante. Responda em portugues."
-        ),
-        user_message=full_context,
-        max_tokens=3000,
-    )
-
-    await send_long(update, f"[Briefing Matinal]\n\n{briefing}")
+def fn_list_workspace():
+    fs = [f for f in WS_ROBERTO.rglob("*") if f.is_file() and not f.name.startswith("_")]
+    return "\n".join(str(f.relative_to(WS_ROBERTO)) for f in fs[:30]) if fs else "Vazio"
 
 
-# ============================================================
-# JOURNALING
-# ============================================================
+# --- TASKS ---
 
-async def cmd_diario(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data("diario")
-    hoje = today_str()
-    if not context.args:
-        entries = data.get(hoje, [])
-        if not entries:
-            await update.message.reply_text(f"Diario {hoje}: vazio.\nUse: /diario [texto]"); return
-        msg = f"=== Diario {hoje} ===\n\n"
-        for i, e in enumerate(entries, 1):
-            msg += f"{i}. [{e['hora']}] {e['texto']}\n\n"
-        await update.message.reply_text(msg); return
-    texto = " ".join(context.args)
+def fn_add_task(texto):
+    data = load_data("tarefas")
+    if "items" not in data: data["items"] = []; data["next_id"] = 1
+    tid = data["next_id"]
+    data["items"].append({"id": tid, "texto": texto, "criada": now_str(), "feita": False, "feita_em": None})
+    data["next_id"] = tid + 1; save_data("tarefas", data)
+    return f"Tarefa #{tid}: {texto}"
+
+def fn_list_tasks():
+    data = load_data("tarefas")
+    pend = [t for t in data.get("items", []) if not t["feita"]]
+    feitas = [t for t in data.get("items", []) if t["feita"] and (t.get("feita_em") or "").startswith(today_str())]
+    msg = ""
+    if pend: msg += "PENDENTES:\n" + "\n".join(f"  #{t['id']} {t['texto']}" for t in pend)
+    if feitas: msg += f"\nHOJE ({len(feitas)}):\n" + "\n".join(f"  #{t['id']} {t['texto']}" for t in feitas)
+    return msg or "Nenhuma tarefa."
+
+def fn_complete_task(task_id):
+    data = load_data("tarefas")
+    for t in data.get("items", []):
+        if t["id"] == task_id and not t["feita"]:
+            t["feita"] = True; t["feita_em"] = now_str(); save_data("tarefas", data)
+            return f"#{task_id} concluida: {t['texto']}"
+    return f"#{task_id} nao encontrada."
+
+
+# --- GOALS ---
+
+def fn_add_goal(texto):
+    data = load_data("metas"); wk = week_key()
+    if wk not in data: data[wk] = []
+    data[wk].append({"texto": texto, "criada": now_str(), "concluida": False})
+    save_data("metas", data)
+    return f"Meta semanal: {texto}"
+
+def fn_list_goals():
+    data = load_data("metas"); wk = week_key(); metas = data.get(wk, [])
+    if not metas: return "Sem metas esta semana."
+    return "\n".join(f"  {i}. [{'OK' if m['concluida'] else '...'}] {m['texto']}"
+        for i, m in enumerate(metas, 1))
+
+
+# --- JOURNAL ---
+
+def fn_add_journal(texto):
+    data = load_data("diario"); hoje = today_str()
     if hoje not in data: data[hoje] = []
     data[hoje].append({"hora": datetime.now(BRT).strftime("%H:%M"), "texto": texto})
     save_data("diario", data)
-    await update.message.reply_text(f"Diario registrado ({len(data[hoje])}a entrada).\n\"{texto[:100]}\"")
+    return f"Diario registrado ({len(data[hoje])}a entrada)"
+
+def fn_view_journal():
+    data = load_data("diario"); hoje = today_str()
+    entries = data.get(hoje, [])
+    if not entries: return "Diario vazio hoje."
+    return "\n".join(f"[{e['hora']}] {e['texto']}" for e in entries)
 
 
-# ============================================================
-# POMODORO
-# ============================================================
+# --- EXERCISE ---
 
-async def pomodoro_done(context: CallbackContext):
-    data = load_data("pomodoros")
-    hoje = today_str()
-    if hoje not in data: data[hoje] = []
-    task_name = context.job.data or "Foco"
-    data[hoje].append({
-        "hora": datetime.now(BRT).strftime("%H:%M"),
-        "tarefa": task_name,
-    })
-    save_data("pomodoros", data)
-    await context.bot.send_message(chat_id=context.job.chat_id,
-        text=f"POMODORO COMPLETO!\nTarefa: {task_name}\nPausa 5min.\nPomodoros hoje: {len(data[hoje])}")
-
-async def cmd_foco(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args or []
-    minutos, tarefa = 25, "Foco geral"
-    if args:
-        try: minutos = int(args[0]); tarefa = " ".join(args[1:]) or "Foco geral"
-        except ValueError: tarefa = " ".join(args)
-    if minutos < 1 or minutos > 120:
-        await update.message.reply_text("1-120 minutos."); return
-    for j in context.job_queue.jobs():
-        if j.name.startswith(f"pomo_{update.effective_chat.id}"): j.schedule_removal()
-    context.job_queue.run_once(pomodoro_done, when=timedelta(minutes=minutos),
-        chat_id=update.effective_chat.id,
-        name=f"pomo_{update.effective_chat.id}_{minutos}", data=tarefa)
-    fim = (datetime.now(BRT) + timedelta(minutes=minutos)).strftime("%H:%M")
-    await update.message.reply_text(
-        f"POMODORO INICIADO\nTarefa: {tarefa}\nDuracao: {minutos}min\nTermina: {fim}")
-
-async def cmd_pausa(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    removed = False
-    for j in context.job_queue.jobs():
-        if j.name.startswith(f"pomo_{update.effective_chat.id}"):
-            j.schedule_removal(); removed = True
-    await update.message.reply_text("Pomodoro cancelado." if removed else "Nenhum pomodoro ativo.")
-
-
-# ============================================================
-# TASKS
-# ============================================================
-
-async def cmd_tarefa(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("/tarefa [descricao]"); return
-    data = load_data("tarefas")
-    if "items" not in data: data["items"] = []; data["next_id"] = 1
-    texto = " ".join(context.args)
-    tid = data["next_id"]
-    data["items"].append({"id": tid, "texto": texto, "criada": now_str(), "feita": False, "feita_em": None})
-    data["next_id"] = tid + 1
-    save_data("tarefas", data)
-    await update.message.reply_text(f"Tarefa #{tid}: \"{texto}\"")
-
-async def cmd_tarefas(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data("tarefas")
-    items = data.get("items", [])
-    pendentes = [t for t in items if not t["feita"]]
-    feitas_hoje = [t for t in items if t["feita"] and (t.get("feita_em") or "").startswith(today_str())]
-    if not pendentes and not feitas_hoje:
-        await update.message.reply_text("Nenhuma tarefa.\n/tarefa [texto]"); return
-    msg = "=== TAREFAS ===\n\n"
-    if pendentes:
-        msg += "PENDENTES:\n"
-        for t in pendentes: msg += f"  #{t['id']} - {t['texto']}\n"
-    if feitas_hoje:
-        msg += f"\nHOJE ({len(feitas_hoje)}):\n"
-        for t in feitas_hoje: msg += f"  #{t['id']} - {t['texto']}\n"
-    msg += f"\n{len(pendentes)} pendente(s) | /feito [n]"
-    await update.message.reply_text(msg)
-
-async def cmd_feito(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args: await update.message.reply_text("/feito [numero]"); return
-    try: tid = int(context.args[0])
-    except: await update.message.reply_text("/feito [numero]"); return
-    data = load_data("tarefas")
-    for t in data.get("items", []):
-        if t["id"] == tid and not t["feita"]:
-            t["feita"] = True; t["feita_em"] = now_str(); save_data("tarefas", data)
-            pend = len([x for x in data["items"] if not x["feita"]])
-            await update.message.reply_text(f"#{tid} concluida!\n\"{t['texto']}\"\n{pend} pendente(s)")
-            return
-    await update.message.reply_text(f"#{tid} nao encontrada.")
-
-
-# ============================================================
-# WEEKLY GOALS
-# ============================================================
-
-async def cmd_meta(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args: await update.message.reply_text("/meta [texto]"); return
-    data = load_data("metas"); wk = week_key()
-    if wk not in data: data[wk] = []
-    texto = " ".join(context.args)
-    data[wk].append({"texto": texto, "criada": now_str(), "concluida": False})
-    save_data("metas", data)
-    await update.message.reply_text(f"Meta semanal ({len(data[wk])}): \"{texto}\"")
-
-async def cmd_metas(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data("metas"); wk = week_key(); metas = data.get(wk, [])
-    if not metas: await update.message.reply_text(f"Sem metas ({wk}).\n/meta [texto]"); return
-    msg = f"=== METAS {wk} ===\n\n"
-    for i, m in enumerate(metas, 1):
-        msg += f"  {i}. [{'OK' if m['concluida'] else '...'}] {m['texto']}\n"
-    msg += f"\n{sum(1 for m in metas if m['concluida'])}/{len(metas)}"
-    await update.message.reply_text(msg)
-
-
-# ============================================================
-# EXERCISE & MOOD
-# ============================================================
-
-async def cmd_treino(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def fn_log_exercise(tipo):
     data = load_data("treinos"); hoje = today_str()
-    if not context.args:
-        all_t = []
-        for d, ts in sorted(data.items(), reverse=True)[:7]:
-            for t in ts: all_t.append(f"  [{d} {t['hora']}] {t['tipo']}")
-        if not all_t: await update.message.reply_text("Nenhum treino.\n/treino [tipo]"); return
-        await update.message.reply_text("=== TREINOS 7 DIAS ===\n\n" + "\n".join(all_t)); return
-    tipo = " ".join(context.args)
     if hoje not in data: data[hoje] = []
     data[hoje].append({"hora": datetime.now(BRT).strftime("%H:%M"), "tipo": tipo})
     save_data("treinos", data)
-    wk = sum(len(data.get((datetime.now(BRT)-timedelta(days=i)).strftime("%Y-%m-%d"), [])) for i in range(7))
-    await update.message.reply_text(f"Treino: {tipo}\nSemana: {wk} sessao(es)")
+    wk = sum(len(data.get((datetime.now(BRT)-timedelta(days=i)).strftime("%Y-%m-%d"), []))
+        for i in range(7))
+    return f"Treino: {tipo}. Semana: {wk} sessao(es)"
 
-async def cmd_humor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+# --- MOOD ---
+
+def fn_log_mood(nivel, nota=""):
     data = load_data("humor"); hoje = today_str()
-    if not context.args:
-        entries = []
-        for d in sorted(data.keys(), reverse=True)[:7]:
-            for e in data[d]:
-                entries.append(f"  [{d} {e['hora']}] {e['nivel']}/5 - {e.get('nota', '')}")
-        if not entries: await update.message.reply_text("Nenhum registro.\n/humor [1-5] [nota]"); return
-        await update.message.reply_text("=== HUMOR ===\n\n" + "\n".join(entries)); return
-    try:
-        nivel = int(context.args[0])
-        assert 1 <= nivel <= 5
-    except: await update.message.reply_text("/humor [1-5] [nota]"); return
-    nota = " ".join(context.args[1:]) if len(context.args) > 1 else ""
     if hoje not in data: data[hoje] = []
     data[hoje].append({"hora": datetime.now(BRT).strftime("%H:%M"), "nivel": nivel, "nota": nota})
     save_data("humor", data)
-    labels = ["", "1/5 pessimo", "2/5 ruim", "3/5 neutro", "4/5 bom", "5/5 otimo"]
-    await update.message.reply_text(f"Humor: {labels[nivel]}\n{nota}")
+    labels = ["", "pessimo", "ruim", "neutro", "bom", "otimo"]
+    return f"Humor: {nivel}/5 ({labels[nivel]}) {nota}"
 
 
-# ============================================================
-# DASHBOARD
-# ============================================================
+# --- DASHBOARD ---
 
-async def cmd_dash(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    hoje = today_str(); agora = datetime.now(BRT).strftime("%H:%M")
+def fn_dashboard():
+    hoje = today_str()
     diario = load_data("diario").get(hoje, [])
     tarefas = load_data("tarefas")
     pend = [t for t in tarefas.get("items", []) if not t["feita"]]
@@ -1049,56 +405,533 @@ async def cmd_dash(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pomos = load_data("pomodoros").get(hoje, [])
     treinos = load_data("treinos").get(hoje, [])
     humor = load_data("humor").get(hoje, [])
-    metas_data = load_data("metas"); metas = metas_data.get(week_key(), [])
-    metas_ok = sum(1 for m in metas if m["concluida"])
-
-    msg = f"=== DASHBOARD {hoje} ({agora}) ===\n\n"
-    msg += f"Diario: {len(diario)} entrada(s)\n"
-    for e in diario[-2:]: msg += f"  [{e['hora']}] {e['texto'][:50]}\n"
-    msg += f"\nTarefas: {len(feitas)} feita(s) / {len(pend)} pendente(s)\n"
-    for t in pend[:5]: msg += f"  #{t['id']} {t['texto'][:40]}\n"
-    msg += f"\nPomodoros: {len(pomos)}\n"
-    msg += f"Treino: {len(treinos)} sessao(es)\n"
-    if humor:
-        h = humor[-1]; msg += f"Humor: {h['nivel']}/5 {h.get('nota', '')}\n"
-    else: msg += "Humor: --\n"
-    msg += f"\nMetas: {metas_ok}/{len(metas)}\n"
-    for m in metas: msg += f"  [{'OK' if m['concluida'] else '...'}] {m['texto'][:40]}\n"
-    await update.message.reply_text(msg)
+    metas = load_data("metas").get(week_key(), [])
+    msg = f"DASHBOARD {hoje}\n"
+    msg += f"Diario: {len(diario)} entradas\n"
+    msg += f"Tarefas: {len(feitas)} feitas / {len(pend)} pendentes\n"
+    if pend: msg += "".join(f"  #{t['id']} {t['texto'][:40]}\n" for t in pend[:5])
+    msg += f"Pomodoros: {len(pomos)}\n"
+    msg += f"Treino: {len(treinos)}\n"
+    if humor: msg += f"Humor: {humor[-1]['nivel']}/5 {humor[-1].get('nota','')}\n"
+    if metas:
+        ok = sum(1 for m in metas if m["concluida"])
+        msg += f"Metas: {ok}/{len(metas)}\n"
+    return msg
 
 
-# ============================================================
-# REVIEW
-# ============================================================
+# --- BRIEFING ---
 
-async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("[Review] Analisando semana...")
+def fn_briefing():
+    parts = []
+    # News
+    news = ""
+    for q in ["Brasil economia hoje", "AI technology news 2026", "world news today"]:
+        news += fn_web_news(q, 3) + "\n"
+    # Reddit
+    reddit = fn_reddit("technology", 5)
+    # Email
+    email_txt = fn_read_emails("gmail", 5) if GMAIL_EMAIL else "(nao configurado)"
+    # Tasks
+    tasks = fn_list_tasks()
+    # Goals
+    goals = fn_list_goals()
+    # Night thoughts
+    pensamentos = load_data("pensamentos_noturnos")
+    ultimo = pensamentos.get("ultimo", "")
+    return (
+        f"NOTICIAS:\n{news}\n\n"
+        f"REDDIT:\n{reddit}\n\n"
+        f"EMAILS:\n{email_txt}\n\n"
+        f"TAREFAS:\n{tasks}\n\n"
+        f"METAS:\n{goals}\n\n"
+        f"REFLEXAO NOTURNA:\n{ultimo or '(nenhuma ainda)'}"
+    )
+
+
+# --- REVIEW ---
+
+def fn_weekly_review():
     days = [(datetime.now(BRT)-timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
     diario = load_data("diario"); tarefas = load_data("tarefas")
     pomos = load_data("pomodoros"); treinos = load_data("treinos")
     humor = load_data("humor"); metas_data = load_data("metas")
-    ctx = "DADOS DA SEMANA:\n\n"
-    ctx += "DIARIO:\n"
+    ctx = ""
     for d in days:
-        for e in diario.get(d, []): ctx += f"  {d} [{e['hora']}] {e['texto'][:150]}\n"
-    ctx += "\nTAREFAS CONCLUIDAS:\n"
+        for e in diario.get(d, []): ctx += f"DIARIO {d}: {e['texto'][:150]}\n"
     for t in tarefas.get("items", []):
-        if t["feita"] and (t.get("feita_em") or "")[:10] in days: ctx += f"  {t['feita_em']}: {t['texto']}\n"
-    ctx += f"\nPENDENTES: {len([t for t in tarefas.get('items', []) if not t['feita']])}\n"
-    total_p = sum(len(pomos.get(d, [])) for d in days)
-    ctx += f"\nPOMODOROS: {total_p}\n"
+        if t["feita"] and (t.get("feita_em") or "")[:10] in days:
+            ctx += f"TAREFA OK: {t['texto']}\n"
+    ctx += f"PENDENTES: {len([t for t in tarefas.get('items', []) if not t['feita']])}\n"
+    ctx += f"POMODOROS: {sum(len(pomos.get(d, [])) for d in days)}\n"
     for d in days:
-        for t in treinos.get(d, []): ctx += f"TREINO: {d} {t['tipo']}\n"
-    for d in days:
-        for h in humor.get(d, []): ctx += f"HUMOR: {d} {h['nivel']}/5 {h.get('nota','')}\n"
-    metas = metas_data.get(week_key(), [])
-    for m in metas: ctx += f"META: [{'OK' if m['concluida'] else 'PENDENTE'}] {m['texto']}\n"
-    review = chat(
-        "Voce e um coach pessoal. Analise a semana e de: "
-        "1. RESUMO (2-3 frases) 2. DESTAQUES 3. PONTOS DE ATENCAO "
-        "4. SUGESTOES 5. NOTA (0-10). Portugues. Motivador e pratico.",
-        ctx, 2000)
-    await send_long(update, f"[Review Semanal]\n\n{review}")
+        for t in treinos.get(d, []): ctx += f"TREINO {d}: {t['tipo']}\n"
+        for h in humor.get(d, []): ctx += f"HUMOR {d}: {h['nivel']}/5 {h.get('nota','')}\n"
+    for m in metas_data.get(week_key(), []):
+        ctx += f"META [{'OK' if m['concluida'] else '...'}]: {m['texto']}\n"
+    return ctx
+
+
+# ============================================================
+# IRIS - MASTER AGENT TOOLS DEFINITION
+# ============================================================
+
+IRIS_TOOLS = [
+    {"type": "function", "function": {
+        "name": "pesquisar_web",
+        "description": "Pesquisa na internet. Use para qualquer pergunta factual, noticias, informacoes.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "Termos de busca"}
+        }, "required": ["query"]}}},
+
+    {"type": "function", "function": {
+        "name": "buscar_noticias",
+        "description": "Busca noticias recentes sobre um tema.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "Tema das noticias"},
+            "n": {"type": "integer", "description": "Quantidade (default 5)"}
+        }, "required": ["query"]}}},
+
+    {"type": "function", "function": {
+        "name": "ler_emails",
+        "description": "Le emails recentes. Conta: gmail ou corp.",
+        "parameters": {"type": "object", "properties": {
+            "conta": {"type": "string", "enum": ["gmail", "corp"], "description": "Conta de email"},
+            "n": {"type": "integer", "description": "Quantidade (default 5)"}
+        }, "required": ["conta"]}}},
+
+    {"type": "function", "function": {
+        "name": "ver_reddit",
+        "description": "Mostra posts populares de um subreddit.",
+        "parameters": {"type": "object", "properties": {
+            "subreddit": {"type": "string", "description": "Nome do subreddit (ex: technology, brasil, artificial)"}
+        }, "required": ["subreddit"]}}},
+
+    {"type": "function", "function": {
+        "name": "gerar_imagem",
+        "description": "Gera imagem com IA a partir de descricao. Crie prompt detalhado em ingles.",
+        "parameters": {"type": "object", "properties": {
+            "prompt": {"type": "string", "description": "Prompt detalhado em INGLES para gerar imagem"}
+        }, "required": ["prompt"]}}},
+
+    {"type": "function", "function": {
+        "name": "criar_arquivo",
+        "description": "Cria arquivo de codigo no workspace.",
+        "parameters": {"type": "object", "properties": {
+            "filename": {"type": "string"}, "content": {"type": "string"}
+        }, "required": ["filename", "content"]}}},
+
+    {"type": "function", "function": {
+        "name": "executar_codigo",
+        "description": "Executa codigo Python e retorna resultado.",
+        "parameters": {"type": "object", "properties": {
+            "code": {"type": "string", "description": "Codigo Python"}
+        }, "required": ["code"]}}},
+
+    {"type": "function", "function": {
+        "name": "executar_comando",
+        "description": "Executa comando shell/bash.",
+        "parameters": {"type": "object", "properties": {
+            "command": {"type": "string"}
+        }, "required": ["command"]}}},
+
+    {"type": "function", "function": {
+        "name": "ler_arquivo",
+        "description": "Le conteudo de arquivo do workspace.",
+        "parameters": {"type": "object", "properties": {
+            "filename": {"type": "string"}
+        }, "required": ["filename"]}}},
+
+    {"type": "function", "function": {
+        "name": "listar_arquivos",
+        "description": "Lista arquivos no workspace de codigo.",
+        "parameters": {"type": "object", "properties": {}}}},
+
+    {"type": "function", "function": {
+        "name": "adicionar_tarefa",
+        "description": "Adiciona nova tarefa/to-do.",
+        "parameters": {"type": "object", "properties": {
+            "texto": {"type": "string", "description": "Descricao da tarefa"}
+        }, "required": ["texto"]}}},
+
+    {"type": "function", "function": {
+        "name": "ver_tarefas",
+        "description": "Lista tarefas pendentes e concluidas hoje.",
+        "parameters": {"type": "object", "properties": {}}}},
+
+    {"type": "function", "function": {
+        "name": "completar_tarefa",
+        "description": "Marca tarefa como concluida pelo numero.",
+        "parameters": {"type": "object", "properties": {
+            "task_id": {"type": "integer", "description": "Numero da tarefa"}
+        }, "required": ["task_id"]}}},
+
+    {"type": "function", "function": {
+        "name": "adicionar_meta",
+        "description": "Adiciona meta semanal.",
+        "parameters": {"type": "object", "properties": {
+            "texto": {"type": "string"}
+        }, "required": ["texto"]}}},
+
+    {"type": "function", "function": {
+        "name": "ver_metas",
+        "description": "Lista metas da semana atual.",
+        "parameters": {"type": "object", "properties": {}}}},
+
+    {"type": "function", "function": {
+        "name": "registrar_diario",
+        "description": "Adiciona entrada no diario/journal.",
+        "parameters": {"type": "object", "properties": {
+            "texto": {"type": "string"}
+        }, "required": ["texto"]}}},
+
+    {"type": "function", "function": {
+        "name": "ver_diario",
+        "description": "Mostra entradas do diario de hoje.",
+        "parameters": {"type": "object", "properties": {}}}},
+
+    {"type": "function", "function": {
+        "name": "registrar_treino",
+        "description": "Registra exercicio/treino realizado.",
+        "parameters": {"type": "object", "properties": {
+            "tipo": {"type": "string", "description": "Tipo de exercicio (ex: musculacao, corrida, yoga)"}
+        }, "required": ["tipo"]}}},
+
+    {"type": "function", "function": {
+        "name": "registrar_humor",
+        "description": "Registra nivel de humor/energia de 1 (pessimo) a 5 (otimo).",
+        "parameters": {"type": "object", "properties": {
+            "nivel": {"type": "integer", "description": "1-5"},
+            "nota": {"type": "string", "description": "Observacao opcional"}
+        }, "required": ["nivel"]}}},
+
+    {"type": "function", "function": {
+        "name": "ver_dashboard",
+        "description": "Mostra dashboard completo do dia (tarefas, humor, treinos, etc).",
+        "parameters": {"type": "object", "properties": {}}}},
+
+    {"type": "function", "function": {
+        "name": "briefing_matinal",
+        "description": "Gera briefing matinal completo (noticias, emails, reddit, tarefas, metas).",
+        "parameters": {"type": "object", "properties": {}}}},
+
+    {"type": "function", "function": {
+        "name": "review_semanal",
+        "description": "Gera review/analise da semana com nota e sugestoes.",
+        "parameters": {"type": "object", "properties": {}}}},
+]
+
+
+# ============================================================
+# IRIS TOOL EXECUTOR
+# ============================================================
+
+def iris_execute_tool(fn_name, fn_args):
+    """Execute any IRIS tool and return result."""
+    print(f"[IRIS] Tool: {fn_name}({json.dumps(fn_args, ensure_ascii=False)[:100]})")
+
+    if fn_name == "pesquisar_web":
+        return fn_web_search(fn_args.get("query", ""))
+    elif fn_name == "buscar_noticias":
+        return fn_web_news(fn_args.get("query", ""), fn_args.get("n", 5))
+    elif fn_name == "ler_emails":
+        return fn_read_emails(fn_args.get("conta", "gmail"), fn_args.get("n", 5))
+    elif fn_name == "ver_reddit":
+        return fn_reddit(fn_args.get("subreddit", "technology"))
+    elif fn_name == "gerar_imagem":
+        path, url = fn_generate_image(fn_args.get("prompt", ""))
+        return f"IMAGE_PATH={path} IMAGE_URL={url}" if path else f"ERRO: {url}"
+    elif fn_name == "criar_arquivo":
+        return fn_create_file(fn_args.get("filename", "out.py"), fn_args.get("content", ""))
+    elif fn_name == "executar_codigo":
+        return fn_run_python(fn_args.get("code", ""))
+    elif fn_name == "executar_comando":
+        return fn_run_bash(fn_args.get("command", ""))
+    elif fn_name == "ler_arquivo":
+        return fn_read_file(fn_args.get("filename", ""))
+    elif fn_name == "listar_arquivos":
+        return fn_list_workspace()
+    elif fn_name == "adicionar_tarefa":
+        return fn_add_task(fn_args.get("texto", ""))
+    elif fn_name == "ver_tarefas":
+        return fn_list_tasks()
+    elif fn_name == "completar_tarefa":
+        return fn_complete_task(fn_args.get("task_id", 0))
+    elif fn_name == "adicionar_meta":
+        return fn_add_goal(fn_args.get("texto", ""))
+    elif fn_name == "ver_metas":
+        return fn_list_goals()
+    elif fn_name == "registrar_diario":
+        return fn_add_journal(fn_args.get("texto", ""))
+    elif fn_name == "ver_diario":
+        return fn_view_journal()
+    elif fn_name == "registrar_treino":
+        return fn_log_exercise(fn_args.get("tipo", ""))
+    elif fn_name == "registrar_humor":
+        return fn_log_mood(fn_args.get("nivel", 3), fn_args.get("nota", ""))
+    elif fn_name == "ver_dashboard":
+        return fn_dashboard()
+    elif fn_name == "briefing_matinal":
+        return fn_briefing()
+    elif fn_name == "review_semanal":
+        return fn_weekly_review()
+    return f"Funcao desconhecida: {fn_name}"
+
+
+# ============================================================
+# IRIS SYSTEM PROMPT
+# ============================================================
+
+IRIS_SYSTEM = (
+    "Voce e IRIS, assistente pessoal inteligente do Paulo. "
+    "Voce coordena TUDO: pesquisas, codigo, imagens, tarefas, emails, noticias, saude. "
+    "Voce fala de forma natural, direta e eficiente em portugues. "
+    "Voce NUNCA pede para o usuario usar comandos com barra. "
+    "Voce age proativamente - se alguem diz 'bom dia', voce oferece o briefing. "
+    "Se alguem menciona uma tarefa, voce registra automaticamente. "
+    "Se alguem pergunta algo factual, voce pesquisa na web. "
+    "\n\n"
+    "REGRAS:\n"
+    "- Quando o usuario pede codigo/programa: use criar_arquivo + executar_codigo\n"
+    "- Quando pede pesquisa/informacao: use pesquisar_web ou buscar_noticias\n"
+    "- Quando pede imagem: crie prompt em ingles e use gerar_imagem\n"
+    "- Quando menciona tarefa/lembrete: use adicionar_tarefa\n"
+    "- Quando diz 'fiz academia/treino': use registrar_treino\n"
+    "- Quando fala de humor/sentimento: use registrar_humor\n"
+    "- Quando pede emails: use ler_emails\n"
+    "- Quando pede noticias/briefing: use buscar_noticias ou briefing_matinal\n"
+    "- Quando pede review: use review_semanal\n"
+    "- Quando pede dashboard/resumo do dia: use ver_dashboard\n"
+    "- Para conversas casuais: responda naturalmente sem ferramentas\n"
+    "\n"
+    "Responda SEMPRE em portugues, de forma concisa e util.\n"
+    "Se precisar de multiplas ferramentas, use todas que forem necessarias."
+)
+
+
+# ============================================================
+# IRIS MAIN HANDLER
+# ============================================================
+
+async def iris_handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Main IRIS handler - processes ALL text messages."""
+    user_msg = update.message.text.strip()
+    if not user_msg:
+        return
+
+    # Save to history
+    add_to_history("user", user_msg)
+
+    # Build conversation context
+    history = get_history()
+    messages = [{"role": "system", "content": IRIS_SYSTEM}]
+
+    # Add recent history for context (last 10 messages)
+    for h in history[-10:]:
+        messages.append({"role": h["role"], "content": h["content"]})
+
+    # If last message is not the current one, add it
+    if not history or history[-1]["content"] != user_msg:
+        messages.append({"role": "user", "content": user_msg})
+
+    # Track images to send
+    images_to_send = []
+
+    # Function calling loop
+    for round_n in range(8):
+        try:
+            resp = client.chat.completions.create(
+                model="deepseek-chat",
+                messages=messages,
+                tools=IRIS_TOOLS,
+                tool_choice="auto",
+                max_tokens=4000,
+                temperature=0.3,
+            )
+        except Exception as e:
+            await update.message.reply_text(f"Erro: {e}")
+            return
+
+        msg = resp.choices[0].message
+
+        if not msg.tool_calls:
+            # Final response
+            response = msg.content.strip() if msg.content else ""
+            if response:
+                add_to_history("assistant", response)
+                # Send images first
+                for img_path, img_url in images_to_send:
+                    try:
+                        if img_path and os.path.exists(img_path):
+                            with open(img_path, "rb") as f:
+                                await update.message.reply_photo(photo=f)
+                        elif img_url:
+                            r = http_requests.get(img_url, timeout=90)
+                            if r.status_code == 200:
+                                await update.message.reply_photo(photo=BytesIO(r.content))
+                    except Exception:
+                        pass
+                # Send text
+                for chunk in split_msg(response):
+                    try:
+                        await update.message.reply_text(chunk)
+                    except Exception:
+                        pass
+            return
+
+        # Execute tools
+        messages.append(msg)
+        for tc in msg.tool_calls:
+            fn_name = tc.function.name
+            try:
+                fn_args = json.loads(tc.function.arguments)
+            except:
+                fn_args = {}
+
+            result = iris_execute_tool(fn_name, fn_args)
+
+            # Check for image results
+            if "IMAGE_PATH=" in str(result):
+                m = re.search(r'IMAGE_PATH=(\S+)\s+IMAGE_URL=(\S+)', str(result))
+                if m:
+                    images_to_send.append((m.group(1), m.group(2)))
+
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": str(result)[:3000],
+            })
+
+    # If we hit max rounds, send what we have
+    await update.message.reply_text("(processamento longo, tente novamente)")
+
+
+# ============================================================
+# POMODORO (still needs special handling for timers)
+# ============================================================
+
+async def pomodoro_done(context: CallbackContext):
+    data = load_data("pomodoros"); hoje = today_str()
+    if hoje not in data: data[hoje] = []
+    task_name = context.job.data or "Foco"
+    data[hoje].append({"hora": datetime.now(BRT).strftime("%H:%M"), "tarefa": task_name})
+    save_data("pomodoros", data)
+    await context.bot.send_message(chat_id=context.job.chat_id,
+        text=f"POMODORO COMPLETO! Tarefa: {task_name}\nPomodoros hoje: {len(data[hoje])}")
+
+async def cmd_foco(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args or []
+    minutos, tarefa = 25, "Foco geral"
+    if args:
+        try: minutos = int(args[0]); tarefa = " ".join(args[1:]) or "Foco geral"
+        except: tarefa = " ".join(args)
+    for j in context.job_queue.jobs():
+        if j.name.startswith(f"pomo_{update.effective_chat.id}"): j.schedule_removal()
+    context.job_queue.run_once(pomodoro_done, when=timedelta(minutes=minutos),
+        chat_id=update.effective_chat.id,
+        name=f"pomo_{update.effective_chat.id}_{minutos}", data=tarefa)
+    fim = (datetime.now(BRT) + timedelta(minutes=minutos)).strftime("%H:%M")
+    await update.message.reply_text(f"Pomodoro: {tarefa} ({minutos}min, termina {fim})")
+
+
+# ============================================================
+# NIGHT THINKING MODE
+# ============================================================
+
+async def night_thinking(context: CallbackContext):
+    """Runs at 3 AM BRT - reviews the day and generates insights."""
+    print("[NIGHT] Iniciando reflexao noturna...")
+
+    chat_id = context.job.data
+    if not chat_id:
+        print("[NIGHT] Sem chat_id configurado")
+        return
+
+    # Gather all data from today
+    hoje = today_str()
+    ontem = (datetime.now(BRT) - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    history = get_history()
+    diario = load_data("diario")
+    tarefas = load_data("tarefas")
+    humor = load_data("humor")
+    treinos = load_data("treinos")
+    pomos = load_data("pomodoros")
+    metas = load_data("metas").get(week_key(), [])
+    pensamentos_prev = load_data("pensamentos_noturnos")
+
+    # Build context
+    ctx = "=== DADOS DO DIA ===\n\n"
+
+    ctx += "CONVERSAS RECENTES:\n"
+    for h in history[-20:]:
+        ctx += f"[{h.get('time','')}] {h['role']}: {h['content'][:200]}\n"
+
+    ctx += f"\nDIARIO {hoje}:\n"
+    for e in diario.get(hoje, []):
+        ctx += f"  {e['texto'][:200]}\n"
+
+    ctx += f"\nTAREFAS PENDENTES:\n"
+    for t in tarefas.get("items", []):
+        if not t["feita"]: ctx += f"  #{t['id']} {t['texto']}\n"
+
+    ctx += f"\nTAREFAS CONCLUIDAS HOJE:\n"
+    for t in tarefas.get("items", []):
+        if t["feita"] and (t.get("feita_em") or "").startswith(hoje):
+            ctx += f"  {t['texto']}\n"
+
+    ctx += f"\nHUMOR: "
+    for h in humor.get(hoje, []):
+        ctx += f"{h['nivel']}/5 {h.get('nota','')} "
+    ctx += "\n"
+
+    ctx += f"TREINOS: "
+    for t in treinos.get(hoje, []):
+        ctx += f"{t['tipo']} "
+    ctx += f"\nPOMODOROS: {len(pomos.get(hoje, []))}\n"
+
+    ctx += f"\nMETAS SEMANA:\n"
+    for m in metas:
+        ctx += f"  [{'OK' if m['concluida'] else '...'}] {m['texto']}\n"
+
+    ctx += f"\nPENSAMENTO ANTERIOR:\n{pensamentos_prev.get('ultimo', 'Nenhum')}\n"
+
+    # Ask AI to think
+    reflexao = chat_simple(
+        system_prompt=(
+            "Voce e IRIS, assistente pessoal inteligente. "
+            "E 3 da manha e voce esta refletindo sobre o dia do Paulo. "
+            "Analise os dados e gere:\n\n"
+            "1. REFLEXAO DO DIA - O que aconteceu, padroes observados (2-3 frases)\n"
+            "2. IDEIAS PARA AMANHA - 2-3 sugestoes praticas baseadas nos dados\n"
+            "3. IDEIA DE MELHORIA DO BOT - Uma sugestao concreta para melhorar o sistema "
+            "(nova funcionalidade, automacao, integracao). Pense como um product manager.\n"
+            "4. TAREFAS SUGERIDAS - Se identificou algo que precisa ser feito\n\n"
+            "Seja conciso, pratico e perspicaz. Portugues."
+        ),
+        user_message=ctx,
+        max_tokens=2000,
+    )
+
+    # Save
+    pensamentos = {
+        "ultimo": reflexao,
+        "data": hoje,
+        "historico": pensamentos_prev.get("historico", []),
+    }
+    pensamentos["historico"].append({"data": hoje, "texto": reflexao[:500]})
+    pensamentos["historico"] = pensamentos["historico"][-30:]  # Keep 30 days
+    save_data("pensamentos_noturnos", pensamentos)
+
+    print(f"[NIGHT] Reflexao salva ({len(reflexao)} chars)")
+
+    # Send summary to Paulo
+    try:
+        await context.bot.send_message(
+            chat_id=int(chat_id),
+            text=f"[IRIS - Reflexao Noturna]\n\n{reflexao}"
+        )
+    except Exception as e:
+        print(f"[NIGHT] Erro ao enviar: {e}")
 
 
 # ============================================================
@@ -1114,15 +947,9 @@ async def cmd_lembretes(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rems = data.get("ativos", [])
         if not rems:
             await update.message.reply_text(
-                "Sem lembretes.\n\n"
-                "/lembretes treino 07:00\n"
-                "/lembretes diario 22:00\n"
-                "/lembretes briefing 07:30\n"
-                "/lembretes limpar")
+                "Sem lembretes.\nExemplos:\n/lembretes treino 07:00\n/lembretes briefing 07:30\n/lembretes limpar")
             return
-        msg = "=== LEMBRETES ===\n\n"
-        for i, r in enumerate(rems, 1): msg += f"  {i}. {r['tipo']} as {r['hora']}\n"
-        msg += "\n/lembretes limpar"
+        msg = "LEMBRETES:\n" + "\n".join(f"  {i}. {r['tipo']} as {r['hora']}" for i, r in enumerate(rems, 1))
         await update.message.reply_text(msg); return
     if context.args[0] == "limpar":
         data["ativos"] = []; save_data("lembretes", data)
@@ -1133,32 +960,24 @@ async def cmd_lembretes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tipo = context.args[0]; hora_str = context.args[1]
     try: h, m = map(int, hora_str.split(":")); assert 0<=h<=23 and 0<=m<=59
     except: await update.message.reply_text("Hora invalida (HH:MM)"); return
-    msgs = {
-        "treino": "Hora do treino! /treino [tipo]",
-        "diario": "Hora do diario! /diario [texto]",
-        "agua": "Beba agua!",
-        "humor": "Como voce esta? /humor [1-5]",
-        "foco": "Hora de focar! /foco",
-        "review": "Review semanal! /review",
-        "briefing": "Bom dia! Use /briefing para seu resumo matinal.",
-        "email": "Confira seus emails! /email",
-        "noticias": "Confira as noticias! /noticias",
-    }
-    msg_text = msgs.get(tipo, f"Lembrete: {tipo}")
+    msgs = {"treino": "Hora do treino!", "diario": "Registre seu diario!",
+        "agua": "Beba agua!", "humor": "Como voce esta?",
+        "briefing": "Bom dia! Seu briefing esta pronto. Diga 'briefing'.",
+        "email": "Confira seus emails!", "noticias": "Confira as noticias!"}
     if "ativos" not in data: data["ativos"] = []
     data["ativos"].append({"tipo": tipo, "hora": hora_str, "chat_id": chat_id})
     save_data("lembretes", data)
     context.job_queue.run_daily(send_reminder, time=dt_time(hour=h, minute=m, tzinfo=BRT),
-        chat_id=chat_id, name=f"rem_{tipo}_{hora_str}", data=msg_text)
-    await update.message.reply_text(f"Lembrete: {tipo} as {hora_str} diariamente.")
+        chat_id=chat_id, name=f"rem_{tipo}_{hora_str}",
+        data=msgs.get(tipo, f"Lembrete: {tipo}"))
+    await update.message.reply_text(f"Lembrete: {tipo} as {hora_str}")
 
 def setup_saved_reminders(app):
     data = load_data("lembretes")
-    msgs = {"treino": "Hora do treino!", "diario": "Hora do diario!",
-        "agua": "Beba agua!", "humor": "Como voce esta? /humor [1-5]",
-        "foco": "Hora de focar!", "review": "Review semanal!",
-        "briefing": "Bom dia! /briefing", "email": "Confira emails! /email",
-        "noticias": "Confira noticias! /noticias"}
+    msgs = {"treino": "Hora do treino!", "diario": "Registre seu diario!",
+        "agua": "Beba agua!", "humor": "Como voce esta?",
+        "briefing": "Bom dia! Diga 'briefing'.", "email": "Confira emails!",
+        "noticias": "Noticias disponiveis!"}
     for r in data.get("ativos", []):
         try:
             h, m = map(int, r["hora"].split(":"))
@@ -1170,41 +989,24 @@ def setup_saved_reminders(app):
 
 
 # ============================================================
-# UTILITY
+# TELEGRAM HELPERS
 # ============================================================
 
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rc = len([f for f in WS_ROBERTO.rglob("*") if f.is_file() and not f.name.startswith("_")])
-    cc = len([f for f in WS_CURIOSO.rglob("*") if f.is_file()])
-    mc = len([f for f in WS_MARLEY.rglob("*") if f.is_file()])
-    pend = len([t for t in load_data("tarefas").get("items", []) if not t["feita"]])
-    gmail_ok = "OK" if GMAIL_EMAIL and GMAIL_APP_PASSWORD else "nao configurado"
-    corp_ok = "OK" if CORP_EMAIL and CORP_PASSWORD else "nao configurado"
-    await update.message.reply_text(
-        f"=== IRONCORE AGENTS v8.0 ===\n"
-        f"LLM: DeepSeek V3\n{datetime.now(BRT):%d/%m/%Y %H:%M}\n\n"
-        f"[Roberto] ONLINE ({rc} arq)\n"
-        f"[Curioso] ONLINE ({cc} arq)\n"
-        f"[Marley] ONLINE ({mc} arq)\n\n"
-        f"Gmail: {gmail_ok}\nCorp: {corp_ok}\n"
-        f"Tarefas: {pend} pendente(s)\nOperacional.")
-
-async def cmd_workspace(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = "=== WORKSPACES ===\n\n"
-    for nm, ws in [("Roberto", WS_ROBERTO), ("Curioso", WS_CURIOSO), ("Marley", WS_MARLEY)]:
-        fs = [f for f in ws.rglob("*") if f.is_file() and not f.name.startswith("_")]
-        msg += f"--- {nm} ---\n"
-        for f in fs[:10]: msg += f"  {f.relative_to(ws)} ({f.stat().st_size:,}b)\n"
-        if not fs: msg += "  (vazio)\n"
-        msg += "\n"
-    await update.message.reply_text(msg)
-
-async def cmd_limpar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    n = 0
-    for ws in (WS_ROBERTO, WS_CURIOSO, WS_MARLEY):
-        for f in ws.rglob("*"):
-            if f.is_file(): f.unlink(); n += 1
-    await update.message.reply_text(f"{n} arquivo(s) removido(s).")
+def split_msg(text, max_len=4000):
+    text = str(text).strip()
+    if not text: return ["(sem resposta)"]
+    if len(text) <= max_len: return [text]
+    chunks, cur = [], ""
+    for par in text.split("\n\n"):
+        if len(cur) + len(par) + 2 <= max_len: cur += par + "\n\n"
+        else:
+            if cur.strip(): chunks.append(cur.strip())
+            if len(par) > max_len:
+                for i in range(0, len(par), max_len): chunks.append(par[i:i+max_len])
+                cur = ""
+            else: cur = par + "\n\n"
+    if cur.strip(): chunks.append(cur.strip())
+    return chunks if chunks else [text[:max_len]]
 
 
 # ============================================================
@@ -1218,39 +1020,60 @@ async def error_handler(update, context):
 
 def main():
     print("=" * 50)
-    print("IRONCORE AGENTS v8.0")
-    print("Assistente Pessoal Completo")
+    print("IRONCORE AGENTS v9.0 - IRIS")
+    print("Agente Mestre + Linguagem Natural")
     print(f"LLM: DeepSeek V3")
     print(f"{datetime.now(BRT):%d/%m/%Y %H:%M:%S}")
     print("=" * 50)
-    print(f"[Roberto]  {WS_ROBERTO}")
-    print(f"[Curioso]  {WS_CURIOSO}")
-    print(f"[Marley]   {WS_MARLEY}")
-    print(f"[Data]     {DATA_DIR}")
-    print(f"[Gmail]    {'OK' if GMAIL_EMAIL else 'nao configurado'}")
-    print(f"[Corp]     {'OK' if CORP_EMAIL else 'nao configurado'}")
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    cmds = [
-        ("start", cmd_start), ("roberto", cmd_roberto), ("curioso", cmd_curioso),
-        ("marley", cmd_marley), ("team", cmd_team),
-        ("noticias", cmd_noticias), ("email", cmd_email), ("reddit", cmd_reddit),
-        ("linkedin", cmd_linkedin), ("briefing", cmd_briefing),
-        ("diario", cmd_diario), ("foco", cmd_foco), ("pausa", cmd_pausa),
-        ("tarefa", cmd_tarefa), ("tarefas", cmd_tarefas), ("feito", cmd_feito),
-        ("meta", cmd_meta), ("metas", cmd_metas), ("review", cmd_review),
-        ("treino", cmd_treino), ("humor", cmd_humor),
-        ("dash", cmd_dash), ("lembretes", cmd_lembretes),
-        ("status", cmd_status), ("workspace", cmd_workspace), ("limpar", cmd_limpar),
-    ]
-    for cmd, fn in cmds:
-        app.add_handler(CommandHandler(cmd, fn))
+    # Slash commands (shortcuts, still work)
+    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text(
+        "=== IRIS v9.0 ===\n"
+        "Assistente pessoal inteligente.\n\n"
+        "Fale naturalmente comigo:\n"
+        "- 'bom dia' -> briefing\n"
+        "- 'me mostre as noticias'\n"
+        "- 'tenho que fazer X' -> tarefa\n"
+        "- 'fiz academia' -> treino\n"
+        "- 'como estao meus emails?'\n"
+        "- 'crie um programa que...'\n"
+        "- 'gere uma imagem de...'\n"
+        "- 'o que tem no reddit?'\n"
+        "- 'como foi minha semana?'\n\n"
+        "Atalhos: /foco /lembretes /status"
+    )))
+    app.add_handler(CommandHandler("foco", cmd_foco))
+    app.add_handler(CommandHandler("lembretes", cmd_lembretes))
+    app.add_handler(CommandHandler("status", lambda u, c: u.message.reply_text(
+        f"=== IRIS v9.0 ===\n{datetime.now(BRT):%d/%m/%Y %H:%M}\n"
+        f"Gmail: {'OK' if GMAIL_EMAIL else 'N/A'}\n"
+        f"Chat ID: {u.effective_chat.id}\nOperacional.")))
+
+    # IRIS handles ALL text messages
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, iris_handle))
+
     app.add_error_handler(error_handler)
+
+    # Restore reminders
     setup_saved_reminders(app)
 
-    print(f"\n{len(cmds)} comandos registrados.")
-    print("Bot pronto. Aguardando Telegram...\n")
+    # Night thinking mode at 3:00 AM BRT
+    target_chat = TELEGRAM_CHAT_ID or None
+    if target_chat:
+        app.job_queue.run_daily(
+            night_thinking,
+            time=dt_time(hour=3, minute=0, tzinfo=BRT),
+            name="night_thinking",
+            data=target_chat,
+        )
+        print(f"[NIGHT] Modo noturno ativo (3:00 AM) -> chat {target_chat}")
+    else:
+        print("[NIGHT] TELEGRAM_CHAT_ID nao configurado. Modo noturno desativado.")
+        print("[NIGHT] Configure para ativar: use /status para ver seu chat_id")
+
+    print(f"\nIRIS pronta. Linguagem natural ativa.\n")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
