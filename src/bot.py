@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 IRONCORE AGENTS v9.1 - IRIS
-Agente mestre com linguagem natural + modo noturno + GitHub + FLUX images
-LLM: Groq Cloud (Llama 3.3 70B) | Imagens: FLUX via Pollinations
+Agente mestre com linguagem natural + modo noturno + GitHub + FLUX images + Files
+LLM: DeepSeek V3 | Imagens: FLUX via Pollinations
 Deploy: Render.com Background Worker
 """
 
@@ -34,7 +34,7 @@ from telegram.ext import (
 # CONFIG
 # ============================================================
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 GMAIL_EMAIL = os.getenv("GMAIL_EMAIL", "")
@@ -45,20 +45,21 @@ CORP_IMAP_SERVER = os.getenv("CORP_IMAP_SERVER", "")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 GITHUB_USER = os.getenv("GITHUB_USER", "")
 
-GROQ_MODEL = "llama-3.3-70b-versatile"
+DEEPSEEK_MODEL = "deepseek-chat"
 
 BRT = timezone(timedelta(hours=-3))
 BASE_DIR = Path(__file__).resolve().parent.parent
 WS_ROBERTO = BASE_DIR / "workspace" / "roberto"
 WS_CURIOSO = BASE_DIR / "workspace" / "curioso"
 WS_MARLEY = BASE_DIR / "workspace" / "marley"
+WS_UPLOADS = BASE_DIR / "workspace" / "uploads"
 DATA_DIR = BASE_DIR / "data"
 
-for d in (WS_ROBERTO, WS_CURIOSO, WS_MARLEY, DATA_DIR):
+for d in (WS_ROBERTO, WS_CURIOSO, WS_MARLEY, WS_UPLOADS, DATA_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
-# Groq client (OpenAI-compatible)
-client = OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
+# DeepSeek client (OpenAI-compatible)
+client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
 
 # GitHub API headers
 GH_HEADERS = {}
@@ -123,7 +124,7 @@ def add_to_history(role, content):
 def chat_simple(system_prompt, user_message, max_tokens=4000):
     try:
         r = client.chat.completions.create(
-            model=GROQ_MODEL,
+            model=DEEPSEEK_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message},
@@ -291,6 +292,112 @@ def fn_generate_image(prompt):
         return None, f"HTTP {resp.status_code}/{resp2.status_code}"
     except Exception as e:
         return None, f"ERRO: {e}"
+
+
+# ============================================================
+# FILE HANDLING (Telegram uploads/downloads)
+# ============================================================
+
+def fn_list_received_files():
+    """List files received via Telegram."""
+    fs = [f for f in WS_UPLOADS.rglob("*") if f.is_file()]
+    if not fs: return "Nenhum arquivo recebido."
+    return "\n".join(f"- {f.name} ({f.stat().st_size:,}b)" for f in fs[:30])
+
+def fn_read_received_file(filename):
+    """Read a received text file."""
+    p = WS_UPLOADS / filename
+    if not p.exists(): return f"Arquivo nao encontrado: {filename}"
+    try:
+        return p.read_text(encoding="utf-8", errors="replace")[:4000]
+    except:
+        return f"Arquivo binario: {filename} ({p.stat().st_size:,}b). Use enviar_arquivo para enviar."
+
+def fn_get_file_path(filename):
+    """Get full path for a file (checks uploads and roberto workspace)."""
+    for ws in (WS_UPLOADS, WS_ROBERTO, WS_MARLEY):
+        p = ws / filename
+        if p.exists():
+            return str(p)
+    return None
+
+
+async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle files sent by user in Telegram."""
+    doc = update.message.document
+    if not doc:
+        return
+
+    file_name = doc.file_name or f"file_{datetime.now():%Y%m%d_%H%M%S}"
+    file_size = doc.file_size or 0
+
+    # Limit: 20MB
+    if file_size > 20 * 1024 * 1024:
+        await update.message.reply_text("Arquivo muito grande (max 20MB).")
+        return
+
+    try:
+        tg_file = await doc.get_file()
+        file_path = WS_UPLOADS / file_name
+        await tg_file.download_to_drive(str(file_path))
+
+        # Save metadata
+        meta = load_data("arquivos_recebidos")
+        if "files" not in meta: meta["files"] = []
+        meta["files"].append({
+            "nome": file_name,
+            "tamanho": file_size,
+            "recebido": now_str(),
+            "path": str(file_path),
+        })
+        meta["files"] = meta["files"][-50:]  # Keep last 50
+        save_data("arquivos_recebidos", meta)
+
+        size_str = f"{file_size:,}b" if file_size < 1024 else f"{file_size/1024:.1f}KB"
+        msg = f"Arquivo recebido: {file_name} ({size_str})"
+
+        # If there's a caption, process it as a message about the file
+        caption = update.message.caption
+        if caption:
+            add_to_history("user", f"[Enviou arquivo: {file_name}] {caption}")
+            # Let IRIS process the caption with file context
+            context_msg = f"O usuario enviou o arquivo '{file_name}' ({size_str}) e disse: {caption}"
+            await update.message.reply_text(msg)
+            # Trigger IRIS with context
+            update.message.text = context_msg
+            await iris_handle(update, context)
+        else:
+            add_to_history("user", f"[Enviou arquivo: {file_name} ({size_str})]")
+            await update.message.reply_text(f"{msg}\nO que deseja fazer com ele?")
+
+    except Exception as e:
+        await update.message.reply_text(f"Erro ao receber arquivo: {e}")
+
+
+async def handle_photo_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle photos sent by user."""
+    photo = update.message.photo[-1] if update.message.photo else None
+    if not photo: return
+
+    try:
+        tg_file = await photo.get_file()
+        file_name = f"foto_{datetime.now():%Y%m%d_%H%M%S}.jpg"
+        file_path = WS_UPLOADS / file_name
+        await tg_file.download_to_drive(str(file_path))
+
+        size = os.path.getsize(str(file_path))
+        add_to_history("user", f"[Enviou foto: {file_name}]")
+
+        caption = update.message.caption
+        if caption:
+            add_to_history("user", f"[Foto: {file_name}] {caption}")
+            await update.message.reply_text(f"Foto recebida: {file_name}")
+            update.message.text = f"O usuario enviou uma foto '{file_name}' e disse: {caption}"
+            await iris_handle(update, context)
+        else:
+            await update.message.reply_text(f"Foto recebida: {file_name} ({size:,}b)")
+    except Exception as e:
+        await update.message.reply_text(f"Erro ao receber foto: {e}")
 
 
 # ============================================================
@@ -882,6 +989,24 @@ IRIS_TOOLS = [
         "name": "review_semanal",
         "description": "Review da semana com analise.",
         "parameters": {"type": "object", "properties": {}}}},
+
+    # --- FILES ---
+    {"type": "function", "function": {
+        "name": "listar_arquivos_recebidos",
+        "description": "Lista arquivos que o usuario enviou via Telegram.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "ler_arquivo_recebido",
+        "description": "Le conteudo de um arquivo recebido via Telegram.",
+        "parameters": {"type": "object", "properties": {
+            "filename": {"type": "string", "description": "Nome do arquivo"}},
+            "required": ["filename"]}}},
+    {"type": "function", "function": {
+        "name": "enviar_arquivo",
+        "description": "Envia um arquivo do workspace para o usuario no Telegram. Use apos criar ou processar arquivos.",
+        "parameters": {"type": "object", "properties": {
+            "filename": {"type": "string", "description": "Nome do arquivo para enviar"}},
+            "required": ["filename"]}}},
 ]
 
 
@@ -936,6 +1061,13 @@ def iris_execute_tool(fn_name, fn_args):
         if fn_name == "ver_dashboard": return fn_dashboard()
         if fn_name == "briefing_matinal": return fn_briefing()
         if fn_name == "review_semanal": return fn_weekly_review()
+        # Files
+        if fn_name == "listar_arquivos_recebidos": return fn_list_received_files()
+        if fn_name == "ler_arquivo_recebido": return fn_read_received_file(fn_args.get("filename", ""))
+        if fn_name == "enviar_arquivo":
+            path = fn_get_file_path(fn_args.get("filename", ""))
+            if path: return f"SEND_FILE={path}"
+            return f"Arquivo nao encontrado: {fn_args.get('filename', '')}"
         return f"Funcao desconhecida: {fn_name}"
     except Exception as e:
         return f"ERRO em {fn_name}: {e}"
@@ -968,6 +1100,9 @@ IRIS_SYSTEM = (
     "- Conversa casual: responda sem ferramentas\n"
     "\n"
     "Para GitHub: o usuario tem repos no GitHub. Use as ferramentas github_* para interagir.\n"
+    "Para arquivos: o usuario pode enviar arquivos pelo Telegram. Use listar_arquivos_recebidos "
+    "para ver, ler_arquivo_recebido para ler, e enviar_arquivo para enviar de volta.\n"
+    "Apos criar arquivos com codigo, SEMPRE use enviar_arquivo para enviar ao usuario.\n"
     "Responda SEMPRE em portugues, conciso e util."
 )
 
@@ -990,11 +1125,12 @@ async def iris_handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         messages.append({"role": "user", "content": user_msg})
 
     images_to_send = []
+    files_to_send = []
 
     for round_n in range(8):
         try:
             resp = client.chat.completions.create(
-                model=GROQ_MODEL,
+                model=DEEPSEEK_MODEL,
                 messages=messages,
                 tools=IRIS_TOOLS,
                 tool_choice="auto",
@@ -1020,6 +1156,17 @@ async def iris_handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             if r.status_code == 200:
                                 await update.message.reply_photo(photo=BytesIO(r.content))
                     except: pass
+                # Send files
+                for fpath in files_to_send:
+                    try:
+                        if os.path.exists(fpath):
+                            fname = os.path.basename(fpath)
+                            with open(fpath, "rb") as f:
+                                await update.message.reply_document(
+                                    document=f, filename=fname,
+                                    caption=f"Arquivo: {fname}")
+                    except Exception as ef:
+                        await update.message.reply_text(f"Erro ao enviar {fpath}: {ef}")
                 for chunk in split_msg(response):
                     try: await update.message.reply_text(chunk)
                     except: pass
@@ -1034,6 +1181,9 @@ async def iris_handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if "IMAGE_PATH=" in str(result):
                 m = re.search(r'IMAGE_PATH=(\S+)\s+IMAGE_URL=(\S+)', str(result))
                 if m: images_to_send.append((m.group(1), m.group(2)))
+            if "SEND_FILE=" in str(result):
+                m2 = re.search(r'SEND_FILE=(\S+)', str(result))
+                if m2: files_to_send.append(m2.group(1))
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": str(result)[:3000]})
 
     await update.message.reply_text("(processamento longo, tente novamente)")
@@ -1216,7 +1366,7 @@ async def error_handler(update, context):
 def main():
     print("=" * 50)
     print("IRONCORE AGENTS v9.1 - IRIS")
-    print(f"LLM: Groq ({GROQ_MODEL})")
+    print(f"LLM: DeepSeek V3")
     print(f"Image: FLUX via Pollinations")
     print(f"GitHub: {'OK' if GITHUB_TOKEN else 'N/A'}")
     print(f"{datetime.now(BRT):%d/%m/%Y %H:%M:%S}")
@@ -1236,18 +1386,21 @@ def main():
         "- 'mostra meus repos'\n"
         "- 'le o arquivo X do paide3'\n"
         "- 'cria issue no paide3'\n"
-        "- 'como foi minha semana?'\n"
+        "- 'como foi minha semana?'\n\n"
+        "Envie arquivos e fotos diretamente!\n"
     )))
     app.add_handler(CommandHandler("foco", cmd_foco))
     app.add_handler(CommandHandler("lembretes", cmd_lembretes))
     app.add_handler(CommandHandler("status", lambda u, c: u.message.reply_text(
         f"=== IRIS v9.1 ===\n{datetime.now(BRT):%d/%m/%Y %H:%M}\n"
-        f"LLM: Groq ({GROQ_MODEL})\nImage: FLUX/Pollinations\n"
+        f"LLM: DeepSeek V3\nImage: FLUX/Pollinations\n"
         f"Gmail: {'OK' if GMAIL_EMAIL else 'N/A'}\n"
         f"GitHub: {'OK' if GITHUB_TOKEN else 'N/A'} ({GITHUB_USER})\n"
         f"Chat ID: {u.effective_chat.id}\nOperacional.")))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, iris_handle))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_file_upload))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo_upload))
     app.add_error_handler(error_handler)
     setup_saved_reminders(app)
 
