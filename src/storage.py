@@ -33,12 +33,23 @@ def init_db():
     """Inicializa o banco de dados com o schema"""
     schema_path = Path(__file__).parent.parent / "iris_schema.sql"
     
-    with get_db() as conn:
-        if schema_path.exists():
-            conn.executescript(schema_path.read_text(encoding="utf-8"))
-        else:
-            # Schema inline caso o arquivo não exista
-            conn.executescript("""
+    try:
+        with get_db() as conn:
+            if schema_path.exists():
+                schema_sql = schema_path.read_text(encoding="utf-8")
+                # Executar linha por linha para evitar erros com indices já existentes
+                for statement in schema_sql.split(';'):
+                    statement = statement.strip()
+                    if statement:
+                        try:
+                            conn.execute(statement)
+                        except sqlite3.OperationalError as e:
+                            # Ignorar erros de "already exists"
+                            if "already exists" not in str(e):
+                                raise
+            else:
+                # Schema inline caso o arquivo não exista
+                conn.executescript("""
                 CREATE TABLE IF NOT EXISTS conversation_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     role TEXT NOT NULL,
@@ -118,6 +129,9 @@ def init_db():
                 );
                 CREATE INDEX IF NOT EXISTS idx_reminders_ativo ON reminders(ativo, hora);
             """)
+    except Exception as e:
+        print(f"[STORAGE] Warning during init_db: {e}")
+        # Continuar mesmo com erro - banco pode já estar inicializado
 
 
 # ============================================================
