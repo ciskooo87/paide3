@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 IRONCORE AGENTS v9.1 - IRIS
 Agente mestre com linguagem natural + modo noturno + GitHub + FLUX images + Files
@@ -18,27 +18,6 @@ from email.header import decode_header
 from datetime import datetime, timedelta, timezone, time as dt_time
 from io import BytesIO
 from pathlib import Path
-
-# Storage SQLite
-import sys
-sys.path.append("src")
-import storage
-
-# Funções temporárias para dados não migrados (arquivos recebidos)
-def load_data(name):
-    """Wrapper temporário para dados ainda em JSON"""
-    filepath = DATA_DIR / f"{name}.json"
-    if filepath.exists():
-        try:
-            return json.loads(filepath.read_text(encoding="utf-8"))
-        except:
-            return {}
-    return {}
-
-def save_data(name, data):
-    """Wrapper temporário para dados ainda em JSON"""
-    filepath = DATA_DIR / f"{name}.json"
-    filepath.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 warnings.filterwarnings("ignore")
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -97,6 +76,17 @@ GH_API = "https://api.github.com"
 # STORAGE
 # ============================================================
 
+def load_data(name):
+    f = DATA_DIR / f"{name}.json"
+    if f.exists():
+        try: return json.loads(f.read_text(encoding="utf-8"))
+        except: return {}
+    return {}
+
+def save_data(name, data):
+    f = DATA_DIR / f"{name}.json"
+    f.write_text(json.dumps(data, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+
 def today_str(): return datetime.now(BRT).strftime("%Y-%m-%d")
 def now_str(): return datetime.now(BRT).strftime("%Y-%m-%d %H:%M")
 def week_key():
@@ -110,7 +100,21 @@ def week_key():
 
 MAX_HISTORY = 30
 
-# Funções de histórico agora são fornecidas por storage.py
+def get_history():
+    data = load_data("historico")
+    return data.get("mensagens", [])
+
+def add_to_history(role, content):
+    data = load_data("historico")
+    if "mensagens" not in data:
+        data["mensagens"] = []
+    data["mensagens"].append({
+        "role": role,
+        "content": content[:1000],
+        "time": now_str(),
+    })
+    data["mensagens"] = data["mensagens"][-MAX_HISTORY:]
+    save_data("historico", data)
 
 
 # ============================================================
@@ -355,7 +359,7 @@ async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # If there's a caption, process it as a message about the file
         caption = update.message.caption
         if caption:
-            storage.add_to_history("user", f"[Enviou arquivo: {file_name}] {caption}")
+            add_to_history("user", f"[Enviou arquivo: {file_name}] {caption}")
             # Let IRIS process the caption with file context
             context_msg = f"O usuario enviou o arquivo '{file_name}' ({size_str}) e disse: {caption}"
             await update.message.reply_text(msg)
@@ -363,7 +367,7 @@ async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE)
             update.message.text = context_msg
             await iris_handle(update, context)
         else:
-            storage.add_to_history("user", f"[Enviou arquivo: {file_name} ({size_str})]")
+            add_to_history("user", f"[Enviou arquivo: {file_name} ({size_str})]")
             await update.message.reply_text(f"{msg}\nO que deseja fazer com ele?")
 
     except Exception as e:
@@ -382,11 +386,11 @@ async def handle_photo_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
         await tg_file.download_to_drive(str(file_path))
 
         size = os.path.getsize(str(file_path))
-        storage.add_to_history("user", f"[Enviou foto: {file_name}]")
+        add_to_history("user", f"[Enviou foto: {file_name}]")
 
         caption = update.message.caption
         if caption:
-            storage.add_to_history("user", f"[Foto: {file_name}] {caption}")
+            add_to_history("user", f"[Foto: {file_name}] {caption}")
             await update.message.reply_text(f"Foto recebida: {file_name}")
             update.message.text = f"O usuario enviou uma foto '{file_name}' e disse: {caption}"
             await iris_handle(update, context)
@@ -665,77 +669,83 @@ def fn_list_workspace():
 # ============================================================
 
 def fn_add_task(texto):
-    task_id = storage.add_task(texto)
-    return f"Tarefa #{task_id}: {texto}"
+    data = load_data("tarefas")
+    if "items" not in data: data["items"] = []; data["next_id"] = 1
+    tid = data["next_id"]
+    data["items"].append({"id": tid, "texto": texto, "criada": now_str(), "feita": False, "feita_em": None})
+    data["next_id"] = tid + 1; save_data("tarefas", data)
+    return f"Tarefa #{tid}: {texto}"
 
 def fn_list_tasks():
-    tasks = storage.get_tasks()
-    pend = [t for t in tasks if not t["feita"]]
-    feitas = [t for t in tasks if t["feita"] and (t.get("feita_em") or "").startswith(today_str())]
+    data = load_data("tarefas")
+    pend = [t for t in data.get("items", []) if not t["feita"]]
+    feitas = [t for t in data.get("items", []) if t["feita"] and (t.get("feita_em") or "").startswith(today_str())]
     msg = ""
     if pend: msg += "PENDENTES:\n" + "\n".join(f"  #{t['id']} {t['texto']}" for t in pend)
     if feitas: msg += f"\nHOJE ({len(feitas)}):\n" + "\n".join(f"  #{t['id']} {t['texto']}" for t in feitas)
     return msg or "Nenhuma tarefa."
 
 def fn_complete_task(task_id):
-    tasks = storage.get_tasks()
-    for t in tasks:
+    data = load_data("tarefas")
+    for t in data.get("items", []):
         if t["id"] == task_id and not t["feita"]:
-            storage.complete_task(task_id)
+            t["feita"] = True; t["feita_em"] = now_str(); save_data("tarefas", data)
             return f"#{task_id} concluida: {t['texto']}"
     return f"#{task_id} nao encontrada."
 
 def fn_add_goal(texto):
-    wk = week_key()
-    goal_id = storage.add_weekly_goal(wk, texto)
+    data = load_data("metas"); wk = week_key()
+    if wk not in data: data[wk] = []
+    data[wk].append({"texto": texto, "criada": now_str(), "concluida": False})
+    save_data("metas", data)
     return f"Meta semanal: {texto}"
 
 def fn_list_goals():
-    wk = week_key()
-    metas = storage.get_weekly_goals(wk)
+    data = load_data("metas"); wk = week_key(); metas = data.get(wk, [])
     if not metas: return "Sem metas esta semana."
     return "\n".join(f"  {i}. [{'OK' if m['concluida'] else '...'}] {m['texto']}"
         for i, m in enumerate(metas, 1))
 
 def fn_add_journal(texto):
-    hoje = today_str()
-    storage.add_diary_entry(hoje, texto)
-    entries = storage.get_diary_entries(hoje)
-    return f"Diario registrado ({len(entries)}a entrada)"
+    data = load_data("diario"); hoje = today_str()
+    if hoje not in data: data[hoje] = []
+    data[hoje].append({"hora": datetime.now(BRT).strftime("%H:%M"), "texto": texto})
+    save_data("diario", data)
+    return f"Diario registrado ({len(data[hoje])}a entrada)"
 
 def fn_view_journal():
-    hoje = today_str()
-    entries = storage.get_diary_entries(hoje)
+    data = load_data("diario"); hoje = today_str()
+    entries = data.get(hoje, [])
     if not entries: return "Diario vazio hoje."
-    return "\n".join(f"[{e.get('time', e.get('hora', ''))}] {e['texto']}" for e in entries)
+    return "\n".join(f"[{e['hora']}] {e['texto']}" for e in entries)
 
 def fn_log_exercise(tipo):
-    hoje = today_str()
-    storage.add_workout(hoje, tipo)
-    # Contar treinos da semana
-    wk = 0
-    for i in range(7):
-        data_dia = (datetime.now(BRT)-timedelta(days=i)).strftime("%Y-%m-%d")
-        wk += len(storage.get_workouts(data_dia))
+    data = load_data("treinos"); hoje = today_str()
+    if hoje not in data: data[hoje] = []
+    data[hoje].append({"hora": datetime.now(BRT).strftime("%H:%M"), "tipo": tipo})
+    save_data("treinos", data)
+    wk = sum(len(data.get((datetime.now(BRT)-timedelta(days=i)).strftime("%Y-%m-%d"), []))
+        for i in range(7))
     return f"Treino: {tipo}. Semana: {wk} sessao(es)"
 
 def fn_log_mood(nivel, nota=""):
-    hoje = today_str()
-    storage.add_mood(hoje, nivel, nota)
+    data = load_data("humor"); hoje = today_str()
+    if hoje not in data: data[hoje] = []
+    data[hoje].append({"hora": datetime.now(BRT).strftime("%H:%M"), "nivel": nivel, "nota": nota})
+    save_data("humor", data)
     labels = ["", "pessimo", "ruim", "neutro", "bom", "otimo"]
     return f"Humor: {nivel}/5 ({labels[nivel]}) {nota}"
 
 def fn_dashboard():
     hoje = today_str()
-    diario = storage.get_diary_entries(hoje)
-    tarefas = storage.get_tasks()
-    pend = [t for t in tarefas if not t["feita"]]
-    feitas = [t for t in tarefas if t["feita"] and (t.get("feita_em") or "").startswith(hoje)]
-    pomos = storage.get_pomodoros(hoje)
-    treinos = storage.get_workouts(hoje)
-    humor = storage.get_mood(hoje)
-    metas = storage.get_weekly_goals(week_key())
-    
+    diario = load_data("diario").get(hoje, [])
+    tarefas = load_data("tarefas")
+    pend = [t for t in tarefas.get("items", []) if not t["feita"]]
+    feitas = [t for t in tarefas.get("items", []) if t["feita"] and (t.get("feita_em") or "").startswith(hoje)]
+    pomos = load_data("pomodoros").get(hoje, [])
+    treinos = load_data("treinos").get(hoje, [])
+    humor = load_data("humor").get(hoje, [])
+    metas = load_data("metas").get(week_key(), [])
     msg = f"DASHBOARD {hoje}\n"
     msg += f"Diario: {len(diario)} entradas\n"
     msg += f"Tarefas: {len(feitas)} feitas / {len(pend)} pendentes\n"
@@ -755,7 +765,7 @@ def fn_briefing():
     email_txt = fn_read_emails("gmail", 5) if GMAIL_EMAIL else "(nao configurado)"
     tasks = fn_list_tasks()
     goals = fn_list_goals()
-    pensamentos = storage.get_last_night_thought()
+    pensamentos = load_data("pensamentos_noturnos")
     ultimo = pensamentos.get("ultimo", "")
     # GitHub activity
     gh_activity = fn_github_activity() if GITHUB_TOKEN else "(nao configurado)"
@@ -767,36 +777,22 @@ def fn_briefing():
 
 def fn_weekly_review():
     days = [(datetime.now(BRT)-timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
-    tarefas = storage.get_tasks()
-    metas = storage.get_weekly_goals(week_key())
-    
+    diario = load_data("diario"); tarefas = load_data("tarefas")
+    pomos = load_data("pomodoros"); treinos = load_data("treinos")
+    humor = load_data("humor"); metas_data = load_data("metas")
     ctx = ""
-    # Diário
     for d in days:
-        for e in storage.get_diary_entries(d): 
-            ctx += f"DIARIO {d}: {e['texto'][:150]}\n"
-    
-    # Tarefas concluídas
-    for t in tarefas:
+        for e in diario.get(d, []): ctx += f"DIARIO {d}: {e['texto'][:150]}\n"
+    for t in tarefas.get("items", []):
         if t["feita"] and (t.get("feita_em") or "")[:10] in days:
             ctx += f"TAREFA OK: {t['texto']}\n"
-    ctx += f"PENDENTES: {len([t for t in tarefas if not t['feita']])}\n"
-    
-    # Pomodoros
-    total_pomos = sum(len(storage.get_pomodoros(d)) for d in days)
-    ctx += f"POMODOROS: {total_pomos}\n"
-    
-    # Treinos e humor
+    ctx += f"PENDENTES: {len([t for t in tarefas.get('items', []) if not t['feita']])}\n"
+    ctx += f"POMODOROS: {sum(len(pomos.get(d, [])) for d in days)}\n"
     for d in days:
-        for t in storage.get_workouts(d): 
-            ctx += f"TREINO {d}: {t['tipo']}\n"
-        for h in storage.get_mood(d): 
-            ctx += f"HUMOR {d}: {h['nivel']}/5 {h.get('nota','')}\n"
-    
-    # Metas
-    for m in metas:
+        for t in treinos.get(d, []): ctx += f"TREINO {d}: {t['tipo']}\n"
+        for h in humor.get(d, []): ctx += f"HUMOR {d}: {h['nivel']}/5 {h.get('nota','')}\n"
+    for m in metas_data.get(week_key(), []):
         ctx += f"META [{'OK' if m['concluida'] else '...'}]: {m['texto']}\n"
-    
     return ctx
 
 
@@ -1119,9 +1115,9 @@ async def iris_handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_msg = update.message.text.strip()
     if not user_msg: return
 
-    storage.add_to_history("user", user_msg)
+    add_to_history("user", user_msg)
 
-    history = storage.get_history()
+    history = get_history()
     messages = [{"role": "system", "content": IRIS_SYSTEM}]
     for h in history[-10:]:
         messages.append({"role": h["role"], "content": h["content"]})
@@ -1149,7 +1145,7 @@ async def iris_handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not msg.tool_calls:
             response = msg.content.strip() if msg.content else ""
             if response:
-                storage.add_to_history("assistant", response)
+                add_to_history("assistant", response)
                 for img_path, img_url in images_to_send:
                     try:
                         if img_path and os.path.exists(img_path):
@@ -1198,12 +1194,13 @@ async def iris_handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 
 async def pomodoro_done(context: CallbackContext):
-    hoje = today_str()
+    data = load_data("pomodoros"); hoje = today_str()
+    if hoje not in data: data[hoje] = []
     task_name = context.job.data or "Foco"
-    storage.add_pomodoro(hoje, task_name, 25)
-    pomodoros_hoje = storage.get_pomodoros(hoje)
+    data[hoje].append({"hora": datetime.now(BRT).strftime("%H:%M"), "tarefa": task_name})
+    save_data("pomodoros", data)
     await context.bot.send_message(chat_id=context.job.chat_id,
-        text=f"POMODORO COMPLETO! Tarefa: {task_name}\nPomodoros hoje: {len(pomodoros_hoje)}")
+        text=f"POMODORO COMPLETO! Tarefa: {task_name}\nPomodoros hoje: {len(data[hoje])}")
 
 async def cmd_foco(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args or []
@@ -1225,22 +1222,63 @@ async def cmd_foco(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 
 async def night_thinking(context: CallbackContext):
-    hoje = today_str()
-    
-    # Gerar reflexão
-    prompt = f"""Reflita sobre o dia {hoje}. Analise:
-- Progresso nas metas
-- Padrões de humor e energia
-- Insights e aprendizados
-Seja breve (3-4 frases), filosófico e construtivo."""
-    
-    reflexao = chat_simple("Você é um assistente reflexivo.", prompt, 500)
-    
-    # Salvar pensamento
-    storage.save_night_thought(hoje, reflexao)
-    
+    print("[NIGHT] Iniciando reflexao noturna...")
     chat_id = context.job.data
-    await context.bot.send_message(chat_id=chat_id, text=f"🌙 REFLEXÃO NOTURNA\n\n{reflexao}")
+    if not chat_id:
+        print("[NIGHT] Sem chat_id"); return
+
+    hoje = today_str()
+    history = get_history()
+    diario = load_data("diario")
+    tarefas = load_data("tarefas")
+    humor = load_data("humor")
+    treinos = load_data("treinos")
+    pomos = load_data("pomodoros")
+    metas = load_data("metas").get(week_key(), [])
+    pensamentos_prev = load_data("pensamentos_noturnos")
+
+    ctx = "=== DADOS DO DIA ===\n\n"
+    ctx += "CONVERSAS RECENTES:\n"
+    for h in history[-20:]:
+        ctx += f"[{h.get('time','')}] {h['role']}: {h['content'][:200]}\n"
+    ctx += f"\nDIARIO {hoje}:\n"
+    for e in diario.get(hoje, []): ctx += f"  {e['texto'][:200]}\n"
+    ctx += f"\nTAREFAS PENDENTES:\n"
+    for t in tarefas.get("items", []):
+        if not t["feita"]: ctx += f"  #{t['id']} {t['texto']}\n"
+    ctx += f"\nCONCLUIDAS HOJE:\n"
+    for t in tarefas.get("items", []):
+        if t["feita"] and (t.get("feita_em") or "").startswith(hoje): ctx += f"  {t['texto']}\n"
+    ctx += f"\nHUMOR: "
+    for h in humor.get(hoje, []): ctx += f"{h['nivel']}/5 {h.get('nota','')} "
+    ctx += f"\nTREINOS: "
+    for t in treinos.get(hoje, []): ctx += f"{t['tipo']} "
+    ctx += f"\nPOMODOROS: {len(pomos.get(hoje, []))}\n"
+    ctx += f"\nMETAS SEMANA:\n"
+    for m in metas: ctx += f"  [{'OK' if m['concluida'] else '...'}] {m['texto']}\n"
+    ctx += f"\nPENSAMENTO ANTERIOR:\n{pensamentos_prev.get('ultimo', 'Nenhum')}\n"
+
+    reflexao = chat_simple(
+        "Voce e IRIS. E 3 da manha e voce reflete sobre o dia do Paulo. "
+        "Gere: 1. REFLEXAO DO DIA (2-3 frases) 2. IDEIAS PARA AMANHA (2-3 sugestoes) "
+        "3. MELHORIA DO BOT (uma sugestao concreta de feature/automacao) "
+        "4. TAREFAS SUGERIDAS. Conciso, pratico, portugues.",
+        ctx, 2000)
+
+    pensamentos = {
+        "ultimo": reflexao, "data": hoje,
+        "historico": pensamentos_prev.get("historico", []),
+    }
+    pensamentos["historico"].append({"data": hoje, "texto": reflexao[:500]})
+    pensamentos["historico"] = pensamentos["historico"][-30:]
+    save_data("pensamentos_noturnos", pensamentos)
+    print(f"[NIGHT] Reflexao salva ({len(reflexao)} chars)")
+
+    try:
+        await context.bot.send_message(chat_id=int(chat_id),
+            text=f"[IRIS - Reflexao Noturna]\n\n{reflexao}")
+    except Exception as e:
+        print(f"[NIGHT] Erro envio: {e}")
 
 
 # ============================================================
@@ -1251,45 +1289,41 @@ async def send_reminder(context: CallbackContext):
     await context.bot.send_message(chat_id=context.job.chat_id, text=context.job.data)
 
 async def cmd_lembretes(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    
+    data = load_data("lembretes"); chat_id = update.effective_chat.id
     if not context.args:
-        rems = storage.get_active_reminders()
+        rems = data.get("ativos", [])
         if not rems:
             await update.message.reply_text("Sem lembretes.\n/lembretes treino 07:00\n/lembretes briefing 07:30\n/lembretes limpar"); return
         msg = "LEMBRETES:\n" + "\n".join(f"  {i}. {r['tipo']} as {r['hora']}" for i, r in enumerate(rems, 1))
         await update.message.reply_text(msg); return
-    
     if context.args[0] == "limpar":
-        storage.clear_reminders()
+        data["ativos"] = []; save_data("lembretes", data)
         for j in context.job_queue.jobs():
             if j.name.startswith("rem_"): j.schedule_removal()
         await update.message.reply_text("Lembretes removidos."); return
-    
     if len(context.args) < 2: await update.message.reply_text("/lembretes [tipo] [HH:MM]"); return
-    
     tipo = context.args[0]; hora_str = context.args[1]
     try: h, m = map(int, hora_str.split(":")); assert 0<=h<=23 and 0<=m<=59
     except: await update.message.reply_text("Hora invalida (HH:MM)"); return
-    
     msgs = {"treino": "Hora do treino!", "diario": "Registre seu diario!",
         "agua": "Beba agua!", "humor": "Como voce esta?",
         "briefing": "Bom dia! Diga 'briefing'.", "email": "Confira emails!",
         "noticias": "Noticias disponiveis!"}
-    
-    storage.add_reminder(tipo, hora_str, chat_id)
+    if "ativos" not in data: data["ativos"] = []
+    data["ativos"].append({"tipo": tipo, "hora": hora_str, "chat_id": chat_id})
+    save_data("lembretes", data)
     context.job_queue.run_daily(send_reminder, time=dt_time(hour=h, minute=m, tzinfo=BRT),
         chat_id=chat_id, name=f"rem_{tipo}_{hora_str}",
         data=msgs.get(tipo, f"Lembrete: {tipo}"))
     await update.message.reply_text(f"Lembrete: {tipo} as {hora_str}")
 
 def setup_saved_reminders(app):
-    rems = storage.get_active_reminders()
+    data = load_data("lembretes")
     msgs = {"treino": "Hora do treino!", "diario": "Registre seu diario!",
         "agua": "Beba agua!", "humor": "Como voce esta?",
         "briefing": "Bom dia! Diga 'briefing'.", "email": "Confira emails!",
         "noticias": "Noticias disponiveis!"}
-    for r in rems:
+    for r in data.get("ativos", []):
         try:
             h, m = map(int, r["hora"].split(":"))
             app.job_queue.run_daily(send_reminder, time=dt_time(hour=h, minute=m, tzinfo=BRT),

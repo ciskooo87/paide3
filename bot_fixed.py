@@ -97,6 +97,8 @@ GH_API = "https://api.github.com"
 # STORAGE
 # ============================================================
 
+
+
 def today_str(): return datetime.now(BRT).strftime("%Y-%m-%d")
 def now_str(): return datetime.now(BRT).strftime("%Y-%m-%d %H:%M")
 def week_key():
@@ -727,15 +729,14 @@ def fn_log_mood(nivel, nota=""):
 
 def fn_dashboard():
     hoje = today_str()
-    diario = storage.get_diary_entries(hoje)
+    diario = storage.get_diary_entries.get(hoje, [])
     tarefas = storage.get_tasks()
-    pend = [t for t in tarefas if not t["feita"]]
-    feitas = [t for t in tarefas if t["feita"] and (t.get("feita_em") or "").startswith(hoje)]
-    pomos = storage.get_pomodoros(hoje)
-    treinos = storage.get_workouts(hoje)
-    humor = storage.get_mood(hoje)
-    metas = storage.get_weekly_goals(week_key())
-    
+    pend = [t for t in tarefas.get("items", []) if not t["feita"]]
+    feitas = [t for t in tarefas.get("items", []) if t["feita"] and (t.get("feita_em") or "").startswith(hoje)]
+    pomos = storage.get_pomodoros.get(hoje, [])
+    treinos = storage.get_workouts.get(hoje, [])
+    humor = storage.get_mood.get(hoje, [])
+    metas = storage.get_weekly_goals.get(week_key(), [])
     msg = f"DASHBOARD {hoje}\n"
     msg += f"Diario: {len(diario)} entradas\n"
     msg += f"Tarefas: {len(feitas)} feitas / {len(pend)} pendentes\n"
@@ -767,36 +768,22 @@ def fn_briefing():
 
 def fn_weekly_review():
     days = [(datetime.now(BRT)-timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
-    tarefas = storage.get_tasks()
-    metas = storage.get_weekly_goals(week_key())
-    
+    diario = storage.get_diary_entries; tarefas = storage.get_tasks()
+    pomos = storage.get_pomodoros; treinos = storage.get_workouts
+    humor = storage.get_mood; metas_data = storage.get_weekly_goals
     ctx = ""
-    # Diário
     for d in days:
-        for e in storage.get_diary_entries(d): 
-            ctx += f"DIARIO {d}: {e['texto'][:150]}\n"
-    
-    # Tarefas concluídas
-    for t in tarefas:
+        for e in diario.get(d, []): ctx += f"DIARIO {d}: {e['texto'][:150]}\n"
+    for t in tarefas.get("items", []):
         if t["feita"] and (t.get("feita_em") or "")[:10] in days:
             ctx += f"TAREFA OK: {t['texto']}\n"
-    ctx += f"PENDENTES: {len([t for t in tarefas if not t['feita']])}\n"
-    
-    # Pomodoros
-    total_pomos = sum(len(storage.get_pomodoros(d)) for d in days)
-    ctx += f"POMODOROS: {total_pomos}\n"
-    
-    # Treinos e humor
+    ctx += f"PENDENTES: {len([t for t in tarefas.get('items', []) if not t['feita']])}\n"
+    ctx += f"POMODOROS: {sum(len(pomos.get(d, [])) for d in days)}\n"
     for d in days:
-        for t in storage.get_workouts(d): 
-            ctx += f"TREINO {d}: {t['tipo']}\n"
-        for h in storage.get_mood(d): 
-            ctx += f"HUMOR {d}: {h['nivel']}/5 {h.get('nota','')}\n"
-    
-    # Metas
-    for m in metas:
+        for t in treinos.get(d, []): ctx += f"TREINO {d}: {t['tipo']}\n"
+        for h in humor.get(d, []): ctx += f"HUMOR {d}: {h['nivel']}/5 {h.get('nota','')}\n"
+    for m in metas_data.get(week_key(), []):
         ctx += f"META [{'OK' if m['concluida'] else '...'}]: {m['texto']}\n"
-    
     return ctx
 
 
@@ -1225,22 +1212,63 @@ async def cmd_foco(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 
 async def night_thinking(context: CallbackContext):
-    hoje = today_str()
-    
-    # Gerar reflexão
-    prompt = f"""Reflita sobre o dia {hoje}. Analise:
-- Progresso nas metas
-- Padrões de humor e energia
-- Insights e aprendizados
-Seja breve (3-4 frases), filosófico e construtivo."""
-    
-    reflexao = chat_simple("Você é um assistente reflexivo.", prompt, 500)
-    
-    # Salvar pensamento
-    storage.save_night_thought(hoje, reflexao)
-    
+    print("[NIGHT] Iniciando reflexao noturna...")
     chat_id = context.job.data
-    await context.bot.send_message(chat_id=chat_id, text=f"🌙 REFLEXÃO NOTURNA\n\n{reflexao}")
+    if not chat_id:
+        print("[NIGHT] Sem chat_id"); return
+
+    hoje = today_str()
+    history = storage.get_history()
+    diario = storage.get_diary_entries
+    tarefas = storage.get_tasks()
+    humor = storage.get_mood
+    treinos = storage.get_workouts
+    pomos = storage.get_pomodoros
+    metas = storage.get_weekly_goals.get(week_key(), [])
+    pensamentos_prev = storage.get_last_night_thought()
+
+    ctx = "=== DADOS DO DIA ===\n\n"
+    ctx += "CONVERSAS RECENTES:\n"
+    for h in history[-20:]:
+        ctx += f"[{h.get('time','')}] {h['role']}: {h['content'][:200]}\n"
+    ctx += f"\nDIARIO {hoje}:\n"
+    for e in diario.get(hoje, []): ctx += f"  {e['texto'][:200]}\n"
+    ctx += f"\nTAREFAS PENDENTES:\n"
+    for t in tarefas.get("items", []):
+        if not t["feita"]: ctx += f"  #{t['id']} {t['texto']}\n"
+    ctx += f"\nCONCLUIDAS HOJE:\n"
+    for t in tarefas.get("items", []):
+        if t["feita"] and (t.get("feita_em") or "").startswith(hoje): ctx += f"  {t['texto']}\n"
+    ctx += f"\nHUMOR: "
+    for h in humor.get(hoje, []): ctx += f"{h['nivel']}/5 {h.get('nota','')} "
+    ctx += f"\nTREINOS: "
+    for t in treinos.get(hoje, []): ctx += f"{t['tipo']} "
+    ctx += f"\nPOMODOROS: {len(pomos.get(hoje, []))}\n"
+    ctx += f"\nMETAS SEMANA:\n"
+    for m in metas: ctx += f"  [{'OK' if m['concluida'] else '...'}] {m['texto']}\n"
+    ctx += f"\nPENSAMENTO ANTERIOR:\n{pensamentos_prev.get('ultimo', 'Nenhum')}\n"
+
+    reflexao = chat_simple(
+        "Voce e IRIS. E 3 da manha e voce reflete sobre o dia do Paulo. "
+        "Gere: 1. REFLEXAO DO DIA (2-3 frases) 2. IDEIAS PARA AMANHA (2-3 sugestoes) "
+        "3. MELHORIA DO BOT (uma sugestao concreta de feature/automacao) "
+        "4. TAREFAS SUGERIDAS. Conciso, pratico, portugues.",
+        ctx, 2000)
+
+    pensamentos = {
+        "ultimo": reflexao, "data": hoje,
+        "historico": pensamentos_prev.get("historico", []),
+    }
+    pensamentos["historico"].append({"data": hoje, "texto": reflexao[:500]})
+    pensamentos["historico"] = pensamentos["historico"][-30:]
+    storage.save_night_thought, pensamentos)
+    print(f"[NIGHT] Reflexao salva ({len(reflexao)} chars)")
+
+    try:
+        await context.bot.send_message(chat_id=int(chat_id),
+            text=f"[IRIS - Reflexao Noturna]\n\n{reflexao}")
+    except Exception as e:
+        print(f"[NIGHT] Erro envio: {e}")
 
 
 # ============================================================
@@ -1284,12 +1312,12 @@ async def cmd_lembretes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Lembrete: {tipo} as {hora_str}")
 
 def setup_saved_reminders(app):
-    rems = storage.get_active_reminders()
+    data = storage.get_active_reminders()
     msgs = {"treino": "Hora do treino!", "diario": "Registre seu diario!",
         "agua": "Beba agua!", "humor": "Como voce esta?",
         "briefing": "Bom dia! Diga 'briefing'.", "email": "Confira emails!",
         "noticias": "Noticias disponiveis!"}
-    for r in rems:
+    for r in data.get("ativos", []):
         try:
             h, m = map(int, r["hora"].split(":"))
             app.job_queue.run_daily(send_reminder, time=dt_time(hour=h, minute=m, tzinfo=BRT),
