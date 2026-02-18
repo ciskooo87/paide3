@@ -9,53 +9,20 @@ Deploy: Render.com Background Worker
 import os
 import re
 import json
+import subprocess
 import logging
 import warnings
-from datetime import datetime, timedelta, time as dt_time
+import imaplib
+import email as email_lib
+from email.header import decode_header
+from datetime import datetime, timedelta, timezone, time as dt_time
 from io import BytesIO
+from pathlib import Path
 
-warnings.filterwarnings("ignore")
-logging.getLogger("httpx").setLevel(logging.WARNING)
-
-import requests as http_requests
-from openai import OpenAI
-from telegram import Update
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    ContextTypes, CallbackContext, filters,
-)
-
-# Imports locais
+# Storage SQLite
 import sys
 sys.path.append("src")
 import storage
-from config import (
-    DEEPSEEK_API_KEY, DEEPSEEK_MODEL, DEEPSEEK_BASE_URL,
-    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
-    GITHUB_TOKEN, GMAIL_EMAIL,
-    BRT, DATA_DIR, WS_UPLOADS,
-    MAX_HISTORY, MAX_LLM_ROUNDS, MAX_TOKENS, TEMPERATURE,
-    MAX_FILE_SIZE
-)
-from tools import (
-    fn_web_search, fn_web_news, fn_reddit,
-    fn_read_emails,
-    fn_github_list_repos, fn_github_repo_info, fn_github_list_issues,
-    fn_github_create_issue, fn_github_get_file, fn_github_create_or_update_file,
-    fn_github_list_commits, fn_github_list_prs, fn_github_activity,
-    fn_generate_image,
-    fn_create_file, fn_read_file, fn_list_workspace,
-    fn_run_python, fn_run_bash,
-    fn_list_received_files, fn_read_received_file, fn_get_file_path,
-    fn_add_task, fn_list_tasks, fn_complete_task,
-    fn_add_goal, fn_list_goals,
-    fn_add_journal, fn_view_journal,
-    fn_log_exercise, fn_log_mood,
-    fn_dashboard, fn_briefing, fn_weekly_review
-)
-
-# DeepSeek client
-client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url=DEEPSEEK_BASE_URL)
 
 # Funções temporárias para dados não migrados (arquivos recebidos)
 def load_data(name):
@@ -73,8 +40,77 @@ def save_data(name, data):
     filepath = DATA_DIR / f"{name}.json"
     filepath.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
+warnings.filterwarnings("ignore")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+import requests as http_requests
+from openai import OpenAI
+from telegram import Update
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    ContextTypes, CallbackContext, filters,
+)
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+GMAIL_EMAIL = os.getenv("GMAIL_EMAIL", "")
+GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")
+CORP_EMAIL = os.getenv("CORP_EMAIL", "")
+CORP_PASSWORD = os.getenv("CORP_PASSWORD", "")
+CORP_IMAP_SERVER = os.getenv("CORP_IMAP_SERVER", "")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+GITHUB_USER = os.getenv("GITHUB_USER", "")
+
+DEEPSEEK_MODEL = "deepseek-chat"
+
+BRT = timezone(timedelta(hours=-3))
+BASE_DIR = Path(__file__).resolve().parent.parent
+WS_ROBERTO = BASE_DIR / "workspace" / "roberto"
+WS_CURIOSO = BASE_DIR / "workspace" / "curioso"
+WS_MARLEY = BASE_DIR / "workspace" / "marley"
+WS_UPLOADS = BASE_DIR / "workspace" / "uploads"
+DATA_DIR = BASE_DIR / "data"
+
+for d in (WS_ROBERTO, WS_CURIOSO, WS_MARLEY, WS_UPLOADS, DATA_DIR):
+    d.mkdir(parents=True, exist_ok=True)
+
+# DeepSeek client (OpenAI-compatible)
+client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
+
+# GitHub API headers
+GH_HEADERS = {}
+if GITHUB_TOKEN:
+    GH_HEADERS = {
+        "Authorization": f"token {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github.v3+json",
+        "User-Agent": "IRIS-Agent/1.0",
+    }
+GH_API = "https://api.github.com"
+
+
+# ============================================================
+# STORAGE
+# ============================================================
+
 def today_str(): return datetime.now(BRT).strftime("%Y-%m-%d")
 def now_str(): return datetime.now(BRT).strftime("%Y-%m-%d %H:%M")
+def week_key():
+    d = datetime.now(BRT)
+    return (d - timedelta(days=d.weekday())).strftime("%Y-W%W")
+
+
+# ============================================================
+# CONVERSATION HISTORY
+# ============================================================
+
+MAX_HISTORY = 30
+
+# Funções de histórico agora são fornecidas por storage.py
 
 
 # ============================================================
@@ -88,15 +124,199 @@ def chat_simple(system_prompt, user_message, max_tokens=4000):
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message},
-            ], max_tokens=max_tokens, temperature=TEMPERATURE)
+            ], max_tokens=max_tokens, temperature=0.3)
         return r.choices[0].message.content.strip()
     except Exception as e:
         return f"[ERRO LLM] {e}"
 
 
 # ============================================================
+# WEB SEARCH
+# ============================================================
+
+def fn_web_search(query, max_results=5):
+    try:
+        try:
+            from ddgs import DDGS
+        except ImportError:
+            from duckduckgo_search import DDGS
+        results = []
+        with DDGS() as ddgs:
+            for r in ddgs.text(query, max_results=max_results):
+                results.append(f"- {r['title']}: {r['body'][:200]} ({r['href']})")
+        return "\n".join(results) if results else f"Nenhum resultado: {query}"
+    except Exception as e:
+        return f"ERRO busca: {e}"
+
+def fn_web_news(query, max_results=5):
+    try:
+        try:
+            from ddgs import DDGS
+        except ImportError:
+            from duckduckgo_search import DDGS
+        results = []
+        with DDGS() as ddgs:
+            for r in ddgs.news(query, max_results=max_results):
+                results.append(
+                    f"- [{r.get('source','')}] {r.get('title','')}: "
+                    f"{r.get('body','')[:200]} ({r.get('url', r.get('href',''))})")
+        return "\n".join(results) if results else f"Nenhuma noticia: {query}"
+    except Exception as e:
+        return f"ERRO noticias: {e}"
+
+
+# ============================================================
+# EMAIL
+# ============================================================
+
+def decode_mime_header(raw):
+    if not raw: return ""
+    parts = decode_header(raw)
+    decoded = []
+    for part, charset in parts:
+        if isinstance(part, bytes):
+            try: decoded.append(part.decode(charset or "utf-8", errors="replace"))
+            except: decoded.append(part.decode("utf-8", errors="replace"))
+        else: decoded.append(str(part))
+    return " ".join(decoded)
+
+def get_email_body(msg):
+    body = ""
+    if msg.is_multipart():
+        for part in msg.walk():
+            ct = part.get_content_type()
+            if ct == "text/plain":
+                try:
+                    payload = part.get_payload(decode=True)
+                    body = payload.decode(part.get_content_charset() or "utf-8", errors="replace")
+                    break
+                except: pass
+            elif ct == "text/html" and not body:
+                try:
+                    payload = part.get_payload(decode=True)
+                    html = payload.decode(part.get_content_charset() or "utf-8", errors="replace")
+                    body = re.sub(r'<[^>]+>', ' ', html)
+                    body = re.sub(r'\s+', ' ', body).strip()
+                except: pass
+    else:
+        try:
+            payload = msg.get_payload(decode=True)
+            body = payload.decode(msg.get_content_charset() or "utf-8", errors="replace")
+        except: body = str(msg.get_payload())
+    return body[:1500]
+
+def fn_read_emails(conta="gmail", n=5):
+    if conta == "gmail":
+        if not GMAIL_EMAIL or not GMAIL_APP_PASSWORD:
+            return "Gmail nao configurado. Configure GMAIL_EMAIL e GMAIL_APP_PASSWORD no Render."
+        addr, pwd, srv = GMAIL_EMAIL, GMAIL_APP_PASSWORD, "imap.gmail.com"
+    else:
+        if not CORP_EMAIL or not CORP_PASSWORD:
+            return "Email corporativo nao configurado."
+        addr, pwd, srv = CORP_EMAIL, CORP_PASSWORD, CORP_IMAP_SERVER or "imap.gmail.com"
+    try:
+        mail = imaplib.IMAP4_SSL(srv)
+        mail.login(addr, pwd)
+        mail.select("INBOX", readonly=True)
+        _, data = mail.search(None, "ALL")
+        ids = data[0].split()
+        if not ids: mail.logout(); return "Caixa vazia."
+        results = []
+        for eid in list(reversed(ids[-n:])):
+            _, msg_data = mail.fetch(eid, "(RFC822)")
+            msg = email_lib.message_from_bytes(msg_data[0][1])
+            results.append(
+                f"De: {decode_mime_header(msg.get('From',''))[:80]}\n"
+                f"Assunto: {decode_mime_header(msg.get('Subject',''))[:120]}\n"
+                f"Data: {msg.get('Date','')[:25]}\n"
+                f"Corpo: {get_email_body(msg)[:300]}\n")
+        mail.logout()
+        return "\n---\n".join(results) if results else "Nenhum email."
+    except Exception as e:
+        return f"ERRO email: {e}"
+
+
+# ============================================================
+# REDDIT
+# ============================================================
+
+def fn_reddit(subreddit="technology", limit=8):
+    aliases = {"tech": "technology", "ia": "artificial", "brasil": "brasil",
+        "news": "worldnews", "dev": "programming", "python": "Python",
+        "startup": "startups", "finance": "finance"}
+    sub = aliases.get(subreddit.lower(), subreddit)
+    try:
+        url = f"https://www.reddit.com/r/{sub}/hot.json?limit={limit}"
+        resp = http_requests.get(url, headers={"User-Agent": "IRIS/1.0"}, timeout=15)
+        if resp.status_code != 200: return f"Reddit HTTP {resp.status_code}"
+        posts = []
+        for c in resp.json().get("data", {}).get("children", []):
+            p = c.get("data", {})
+            posts.append(f"[{p.get('score',0)} pts] {p.get('title','')[:150]}")
+        return "\n".join(posts) if posts else "Nenhum post."
+    except Exception as e:
+        return f"ERRO reddit: {e}"
+
+
+# ============================================================
+# IMAGE GENERATION - FLUX via Pollinations
+# ============================================================
+
+def fn_generate_image(prompt):
+    """Generate image using FLUX model via Pollinations (free, high quality)."""
+    try:
+        encoded = http_requests.utils.quote(prompt)
+        seed = int(datetime.now().timestamp()) % 999999
+        url = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&seed={seed}&model=flux"
+        print(f"[IMAGE] Generating: {url[:100]}...")
+        resp = http_requests.get(url, timeout=120, stream=True)
+        if resp.status_code == 200:
+            data = b"".join(resp.iter_content(8192))
+            if len(data) < 500: return None, "Imagem muito pequena"
+            fp = WS_MARLEY / f"img_{datetime.now():%Y%m%d_%H%M%S}.png"
+            fp.write_bytes(data)
+            return str(fp), url
+        # Fallback without model param
+        url2 = f"https://image.pollinations.ai/prompt/{encoded}?width=1024&height=1024&seed={seed}"
+        resp2 = http_requests.get(url2, timeout=120, stream=True)
+        if resp2.status_code == 200:
+            data = b"".join(resp2.iter_content(8192))
+            if len(data) >= 500:
+                fp = WS_MARLEY / f"img_{datetime.now():%Y%m%d_%H%M%S}.png"
+                fp.write_bytes(data)
+                return str(fp), url2
+        return None, f"HTTP {resp.status_code}/{resp2.status_code}"
+    except Exception as e:
+        return None, f"ERRO: {e}"
+
+
+# ============================================================
 # FILE HANDLING (Telegram uploads/downloads)
 # ============================================================
+
+def fn_list_received_files():
+    """List files received via Telegram."""
+    fs = [f for f in WS_UPLOADS.rglob("*") if f.is_file()]
+    if not fs: return "Nenhum arquivo recebido."
+    return "\n".join(f"- {f.name} ({f.stat().st_size:,}b)" for f in fs[:30])
+
+def fn_read_received_file(filename):
+    """Read a received text file."""
+    p = WS_UPLOADS / filename
+    if not p.exists(): return f"Arquivo nao encontrado: {filename}"
+    try:
+        return p.read_text(encoding="utf-8", errors="replace")[:4000]
+    except:
+        return f"Arquivo binario: {filename} ({p.stat().st_size:,}b). Use enviar_arquivo para enviar."
+
+def fn_get_file_path(filename):
+    """Get full path for a file (checks uploads and roberto workspace)."""
+    for ws in (WS_UPLOADS, WS_ROBERTO, WS_MARLEY):
+        p = ws / filename
+        if p.exists():
+            return str(p)
+    return None
+
 
 async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle files sent by user in Telegram."""
@@ -107,7 +327,8 @@ async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE)
     file_name = doc.file_name or f"file_{datetime.now():%Y%m%d_%H%M%S}"
     file_size = doc.file_size or 0
 
-    if file_size > MAX_FILE_SIZE:
+    # Limit: 20MB
+    if file_size > 20 * 1024 * 1024:
         await update.message.reply_text("Arquivo muito grande (max 20MB).")
         return
 
@@ -125,17 +346,20 @@ async def handle_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "recebido": now_str(),
             "path": str(file_path),
         })
-        meta["files"] = meta["files"][-50:]
+        meta["files"] = meta["files"][-50:]  # Keep last 50
         save_data("arquivos_recebidos", meta)
 
         size_str = f"{file_size:,}b" if file_size < 1024 else f"{file_size/1024:.1f}KB"
         msg = f"Arquivo recebido: {file_name} ({size_str})"
 
+        # If there's a caption, process it as a message about the file
         caption = update.message.caption
         if caption:
             storage.add_to_history("user", f"[Enviou arquivo: {file_name}] {caption}")
+            # Let IRIS process the caption with file context
             context_msg = f"O usuario enviou o arquivo '{file_name}' ({size_str}) e disse: {caption}"
             await update.message.reply_text(msg)
+            # Trigger IRIS with context
             update.message.text = context_msg
             await iris_handle(update, context)
         else:
@@ -170,6 +394,410 @@ async def handle_photo_upload(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text(f"Foto recebida: {file_name} ({size:,}b)")
     except Exception as e:
         await update.message.reply_text(f"Erro ao receber foto: {e}")
+
+
+# ============================================================
+# GITHUB API
+# ============================================================
+
+def gh_request(method, endpoint, data=None):
+    """Make authenticated GitHub API request."""
+    if not GITHUB_TOKEN:
+        return {"error": "GITHUB_TOKEN nao configurado no Render."}
+    url = f"{GH_API}{endpoint}"
+    try:
+        if method == "GET":
+            r = http_requests.get(url, headers=GH_HEADERS, timeout=15)
+        elif method == "POST":
+            r = http_requests.post(url, headers=GH_HEADERS, json=data, timeout=15)
+        elif method == "PUT":
+            r = http_requests.put(url, headers=GH_HEADERS, json=data, timeout=15)
+        elif method == "PATCH":
+            r = http_requests.patch(url, headers=GH_HEADERS, json=data, timeout=15)
+        elif method == "DELETE":
+            r = http_requests.delete(url, headers=GH_HEADERS, timeout=15)
+        else:
+            return {"error": f"Metodo desconhecido: {method}"}
+
+        if r.status_code in (200, 201, 204):
+            return r.json() if r.text else {"ok": True}
+        return {"error": f"HTTP {r.status_code}: {r.text[:300]}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def fn_github_list_repos(user=None):
+    """List repositories for user."""
+    u = user or GITHUB_USER
+    if not u: return "GITHUB_USER nao configurado."
+    result = gh_request("GET", f"/users/{u}/repos?sort=updated&per_page=15")
+    if isinstance(result, dict) and "error" in result:
+        return result["error"]
+    if not isinstance(result, list):
+        return "Formato inesperado."
+    repos = []
+    for r in result[:15]:
+        stars = r.get("stargazers_count", 0)
+        lang = r.get("language", "N/A")
+        updated = r.get("updated_at", "")[:10]
+        private = " [PRIVADO]" if r.get("private") else ""
+        repos.append(f"- {r['name']}{private} ({lang}, {stars} stars, atualizado {updated})")
+    return "\n".join(repos) if repos else "Nenhum repositorio."
+
+
+def fn_github_repo_info(repo):
+    """Get detailed info about a repository."""
+    owner = GITHUB_USER
+    if "/" in repo:
+        parts = repo.split("/", 1)
+        owner, repo = parts[0], parts[1]
+    result = gh_request("GET", f"/repos/{owner}/{repo}")
+    if "error" in result: return result["error"]
+    info = (
+        f"Repo: {result.get('full_name', repo)}\n"
+        f"Descricao: {result.get('description', 'N/A')}\n"
+        f"Linguagem: {result.get('language', 'N/A')}\n"
+        f"Stars: {result.get('stargazers_count', 0)} | Forks: {result.get('forks_count', 0)}\n"
+        f"Issues abertas: {result.get('open_issues_count', 0)}\n"
+        f"Criado: {result.get('created_at', '')[:10]}\n"
+        f"Atualizado: {result.get('updated_at', '')[:10]}\n"
+        f"URL: {result.get('html_url', '')}"
+    )
+    return info
+
+
+def fn_github_list_issues(repo, state="open"):
+    """List issues for a repository."""
+    owner = GITHUB_USER
+    if "/" in repo:
+        parts = repo.split("/", 1)
+        owner, repo = parts[0], parts[1]
+    result = gh_request("GET", f"/repos/{owner}/{repo}/issues?state={state}&per_page=10")
+    if isinstance(result, dict) and "error" in result:
+        return result["error"]
+    if not isinstance(result, list):
+        return "Formato inesperado."
+    issues = []
+    for i in result[:10]:
+        if i.get("pull_request"):
+            continue  # Skip PRs
+        labels = ", ".join(l["name"] for l in i.get("labels", []))
+        issues.append(f"#{i['number']} [{i.get('state','')}] {i['title'][:80]}"
+            + (f" ({labels})" if labels else ""))
+    return "\n".join(issues) if issues else f"Nenhuma issue {state}."
+
+
+def fn_github_create_issue(repo, title, body=""):
+    """Create a new issue."""
+    owner = GITHUB_USER
+    if "/" in repo:
+        parts = repo.split("/", 1)
+        owner, repo = parts[0], parts[1]
+    result = gh_request("POST", f"/repos/{owner}/{repo}/issues",
+        {"title": title, "body": body})
+    if "error" in result: return result["error"]
+    return f"Issue #{result.get('number', '?')} criada: {result.get('html_url', '')}"
+
+
+def fn_github_get_file(repo, path):
+    """Read file contents from repo."""
+    owner = GITHUB_USER
+    if "/" in repo:
+        parts = repo.split("/", 1)
+        owner, repo = parts[0], parts[1]
+    result = gh_request("GET", f"/repos/{owner}/{repo}/contents/{path}")
+    if isinstance(result, dict) and "error" in result: return result["error"]
+    if isinstance(result, list):
+        # It's a directory listing
+        items = []
+        for item in result[:30]:
+            tp = item.get("type", "file")
+            items.append(f"[{tp}] {item['name']}" + (f" ({item.get('size',0)}b)" if tp == "file" else ""))
+        return "\n".join(items)
+    # It's a file
+    content = result.get("content", "")
+    encoding = result.get("encoding", "")
+    if encoding == "base64":
+        try:
+            import base64
+            decoded = base64.b64decode(content).decode("utf-8", errors="replace")
+            return decoded[:4000]
+        except:
+            return "(erro ao decodificar)"
+    return content[:4000]
+
+
+def fn_github_create_or_update_file(repo, path, content, message="Update via IRIS"):
+    """Create or update a file in repo."""
+    owner = GITHUB_USER
+    if "/" in repo:
+        parts = repo.split("/", 1)
+        owner, repo = parts[0], parts[1]
+
+    import base64
+    encoded = base64.b64encode(content.encode("utf-8")).decode("utf-8")
+
+    # Check if file exists (need SHA for update)
+    existing = gh_request("GET", f"/repos/{owner}/{repo}/contents/{path}")
+    sha = None
+    if isinstance(existing, dict) and "sha" in existing:
+        sha = existing["sha"]
+
+    payload = {"message": message, "content": encoded}
+    if sha:
+        payload["sha"] = sha
+
+    result = gh_request("PUT", f"/repos/{owner}/{repo}/contents/{path}", payload)
+    if isinstance(result, dict) and "error" in result: return result["error"]
+    action = "atualizado" if sha else "criado"
+    url = result.get("content", {}).get("html_url", "")
+    return f"Arquivo {action}: {path}\n{url}"
+
+
+def fn_github_list_commits(repo, n=10):
+    """List recent commits."""
+    owner = GITHUB_USER
+    if "/" in repo:
+        parts = repo.split("/", 1)
+        owner, repo = parts[0], parts[1]
+    result = gh_request("GET", f"/repos/{owner}/{repo}/commits?per_page={n}")
+    if isinstance(result, dict) and "error" in result: return result["error"]
+    if not isinstance(result, list): return "Formato inesperado."
+    commits = []
+    for c in result[:n]:
+        sha = c.get("sha", "")[:7]
+        msg = c.get("commit", {}).get("message", "")[:80]
+        date = c.get("commit", {}).get("author", {}).get("date", "")[:10]
+        author = c.get("commit", {}).get("author", {}).get("name", "")[:20]
+        commits.append(f"[{sha}] {date} - {msg} ({author})")
+    return "\n".join(commits) if commits else "Nenhum commit."
+
+
+def fn_github_list_prs(repo, state="open"):
+    """List pull requests."""
+    owner = GITHUB_USER
+    if "/" in repo:
+        parts = repo.split("/", 1)
+        owner, repo = parts[0], parts[1]
+    result = gh_request("GET", f"/repos/{owner}/{repo}/pulls?state={state}&per_page=10")
+    if isinstance(result, dict) and "error" in result: return result["error"]
+    if not isinstance(result, list): return "Formato inesperado."
+    prs = []
+    for p in result[:10]:
+        prs.append(f"#{p['number']} [{p.get('state','')}] {p['title'][:80]} "
+            f"({p.get('user',{}).get('login','')})")
+    return "\n".join(prs) if prs else f"Nenhum PR {state}."
+
+
+def fn_github_activity():
+    """Get recent activity across all repos."""
+    if not GITHUB_USER: return "GITHUB_USER nao configurado."
+    # Recent events
+    result = gh_request("GET", f"/users/{GITHUB_USER}/events?per_page=15")
+    if isinstance(result, dict) and "error" in result: return result["error"]
+    if not isinstance(result, list): return "Formato inesperado."
+    events = []
+    for e in result[:15]:
+        tp = e.get("type", "")
+        repo = e.get("repo", {}).get("name", "")
+        date = e.get("created_at", "")[:16].replace("T", " ")
+        if tp == "PushEvent":
+            commits = e.get("payload", {}).get("commits", [])
+            msg = commits[0].get("message", "")[:60] if commits else ""
+            events.append(f"[{date}] Push -> {repo}: {msg}")
+        elif tp == "CreateEvent":
+            ref = e.get("payload", {}).get("ref_type", "")
+            events.append(f"[{date}] Create {ref} -> {repo}")
+        elif tp == "IssuesEvent":
+            action = e.get("payload", {}).get("action", "")
+            title = e.get("payload", {}).get("issue", {}).get("title", "")[:60]
+            events.append(f"[{date}] Issue {action} -> {repo}: {title}")
+        elif tp == "PullRequestEvent":
+            action = e.get("payload", {}).get("action", "")
+            title = e.get("payload", {}).get("pull_request", {}).get("title", "")[:60]
+            events.append(f"[{date}] PR {action} -> {repo}: {title}")
+        else:
+            events.append(f"[{date}] {tp} -> {repo}")
+    return "\n".join(events) if events else "Nenhuma atividade recente."
+
+
+# ============================================================
+# ROBERTO (code execution)
+# ============================================================
+
+def fn_create_file(filename, content):
+    try:
+        p = WS_ROBERTO / filename; p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8"); return f"OK: {filename} ({len(content)}b)"
+    except Exception as e: return f"ERRO: {e}"
+
+def fn_run_python(code):
+    try:
+        tmp = WS_ROBERTO / "_run.py"; tmp.write_text(code, encoding="utf-8")
+        r = subprocess.run(["python3", str(tmp)], capture_output=True, text=True,
+            timeout=30, cwd=str(WS_ROBERTO))
+        return ((r.stdout + "\n" + r.stderr).strip() or "OK")[:3000]
+    except subprocess.TimeoutExpired: return "ERRO: timeout"
+    except Exception as e: return f"ERRO: {e}"
+
+def fn_run_bash(command):
+    if any(x in command for x in ["rm -rf /", "mkfs", ":(){ "]): return "Bloqueado"
+    try:
+        r = subprocess.run(command, shell=True, capture_output=True, text=True,
+            timeout=30, cwd=str(WS_ROBERTO))
+        return ((r.stdout + "\n" + r.stderr).strip() or "OK")[:3000]
+    except Exception as e: return f"ERRO: {e}"
+
+def fn_read_file(filename):
+    try:
+        p = WS_ROBERTO / filename
+        if not p.exists(): return f"Nao encontrado: {filename}"
+        return p.read_text(encoding="utf-8")[:4000]
+    except Exception as e: return f"ERRO: {e}"
+
+def fn_list_workspace():
+    fs = [f for f in WS_ROBERTO.rglob("*") if f.is_file() and not f.name.startswith("_")]
+    return "\n".join(str(f.relative_to(WS_ROBERTO)) for f in fs[:30]) if fs else "Vazio"
+
+
+# ============================================================
+# PRODUCTIVITY FUNCTIONS
+# ============================================================
+
+def fn_add_task(texto):
+    task_id = storage.add_task(texto)
+    return f"Tarefa #{task_id}: {texto}"
+
+def fn_list_tasks():
+    tasks = storage.get_tasks()
+    pend = [t for t in tasks if not t["feita"]]
+    feitas = [t for t in tasks if t["feita"] and (t.get("feita_em") or "").startswith(today_str())]
+    msg = ""
+    if pend: msg += "PENDENTES:\n" + "\n".join(f"  #{t['id']} {t['texto']}" for t in pend)
+    if feitas: msg += f"\nHOJE ({len(feitas)}):\n" + "\n".join(f"  #{t['id']} {t['texto']}" for t in feitas)
+    return msg or "Nenhuma tarefa."
+
+def fn_complete_task(task_id):
+    tasks = storage.get_tasks()
+    for t in tasks:
+        if t["id"] == task_id and not t["feita"]:
+            storage.complete_task(task_id)
+            return f"#{task_id} concluida: {t['texto']}"
+    return f"#{task_id} nao encontrada."
+
+def fn_add_goal(texto):
+    wk = week_key()
+    goal_id = storage.add_weekly_goal(wk, texto)
+    return f"Meta semanal: {texto}"
+
+def fn_list_goals():
+    wk = week_key()
+    metas = storage.get_weekly_goals(wk)
+    if not metas: return "Sem metas esta semana."
+    return "\n".join(f"  {i}. [{'OK' if m['concluida'] else '...'}] {m['texto']}"
+        for i, m in enumerate(metas, 1))
+
+def fn_add_journal(texto):
+    hoje = today_str()
+    storage.add_diary_entry(hoje, texto)
+    entries = storage.get_diary_entries(hoje)
+    return f"Diario registrado ({len(entries)}a entrada)"
+
+def fn_view_journal():
+    hoje = today_str()
+    entries = storage.get_diary_entries(hoje)
+    if not entries: return "Diario vazio hoje."
+    return "\n".join(f"[{e.get('time', e.get('hora', ''))}] {e['texto']}" for e in entries)
+
+def fn_log_exercise(tipo):
+    hoje = today_str()
+    storage.add_workout(hoje, tipo)
+    # Contar treinos da semana
+    wk = 0
+    for i in range(7):
+        data_dia = (datetime.now(BRT)-timedelta(days=i)).strftime("%Y-%m-%d")
+        wk += len(storage.get_workouts(data_dia))
+    return f"Treino: {tipo}. Semana: {wk} sessao(es)"
+
+def fn_log_mood(nivel, nota=""):
+    hoje = today_str()
+    storage.add_mood(hoje, nivel, nota)
+    labels = ["", "pessimo", "ruim", "neutro", "bom", "otimo"]
+    return f"Humor: {nivel}/5 ({labels[nivel]}) {nota}"
+
+def fn_dashboard():
+    hoje = today_str()
+    diario = storage.get_diary_entries(hoje)
+    tarefas = storage.get_tasks()
+    pend = [t for t in tarefas if not t["feita"]]
+    feitas = [t for t in tarefas if t["feita"] and (t.get("feita_em") or "").startswith(hoje)]
+    pomos = storage.get_pomodoros(hoje)
+    treinos = storage.get_workouts(hoje)
+    humor = storage.get_mood(hoje)
+    metas = storage.get_weekly_goals(week_key())
+    
+    msg = f"DASHBOARD {hoje}\n"
+    msg += f"Diario: {len(diario)} entradas\n"
+    msg += f"Tarefas: {len(feitas)} feitas / {len(pend)} pendentes\n"
+    if pend: msg += "".join(f"  #{t['id']} {t['texto'][:40]}\n" for t in pend[:5])
+    msg += f"Pomodoros: {len(pomos)}\nTreino: {len(treinos)}\n"
+    if humor: msg += f"Humor: {humor[-1]['nivel']}/5 {humor[-1].get('nota','')}\n"
+    if metas:
+        ok = sum(1 for m in metas if m["concluida"])
+        msg += f"Metas: {ok}/{len(metas)}\n"
+    return msg
+
+def fn_briefing():
+    news = ""
+    for q in ["Brasil economia hoje", "AI technology news 2026", "world news today"]:
+        news += fn_web_news(q, 3) + "\n"
+    reddit = fn_reddit("technology", 5)
+    email_txt = fn_read_emails("gmail", 5) if GMAIL_EMAIL else "(nao configurado)"
+    tasks = fn_list_tasks()
+    goals = fn_list_goals()
+    pensamentos = storage.get_last_night_thought()
+    ultimo = pensamentos.get("ultimo", "")
+    # GitHub activity
+    gh_activity = fn_github_activity() if GITHUB_TOKEN else "(nao configurado)"
+    return (
+        f"NOTICIAS:\n{news}\n\nREDDIT:\n{reddit}\n\nEMAILS:\n{email_txt}\n\n"
+        f"GITHUB:\n{gh_activity}\n\nTAREFAS:\n{tasks}\n\nMETAS:\n{goals}\n\n"
+        f"REFLEXAO NOTURNA:\n{ultimo or '(nenhuma ainda)'}"
+    )
+
+def fn_weekly_review():
+    days = [(datetime.now(BRT)-timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
+    tarefas = storage.get_tasks()
+    metas = storage.get_weekly_goals(week_key())
+    
+    ctx = ""
+    # Diário
+    for d in days:
+        for e in storage.get_diary_entries(d): 
+            ctx += f"DIARIO {d}: {e['texto'][:150]}\n"
+    
+    # Tarefas concluídas
+    for t in tarefas:
+        if t["feita"] and (t.get("feita_em") or "")[:10] in days:
+            ctx += f"TAREFA OK: {t['texto']}\n"
+    ctx += f"PENDENTES: {len([t for t in tarefas if not t['feita']])}\n"
+    
+    # Pomodoros
+    total_pomos = sum(len(storage.get_pomodoros(d)) for d in days)
+    ctx += f"POMODOROS: {total_pomos}\n"
+    
+    # Treinos e humor
+    for d in days:
+        for t in storage.get_workouts(d): 
+            ctx += f"TREINO {d}: {t['tipo']}\n"
+        for h in storage.get_mood(d): 
+            ctx += f"HUMOR {d}: {h['nivel']}/5 {h.get('nota','')}\n"
+    
+    # Metas
+    for m in metas:
+        ctx += f"META [{'OK' if m['concluida'] else '...'}]: {m['texto']}\n"
+    
+    return ctx
 
 
 # ============================================================
@@ -503,15 +1131,15 @@ async def iris_handle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     images_to_send = []
     files_to_send = []
 
-    for round_n in range(MAX_LLM_ROUNDS):
+    for round_n in range(8):
         try:
             resp = client.chat.completions.create(
                 model=DEEPSEEK_MODEL,
                 messages=messages,
                 tools=IRIS_TOOLS,
                 tool_choice="auto",
-                max_tokens=MAX_TOKENS,
-                temperature=TEMPERATURE,
+                max_tokens=4000,
+                temperature=0.3,
             )
         except Exception as e:
             await update.message.reply_text(f"Erro: {e}")
@@ -703,8 +1331,8 @@ async def error_handler(update, context):
 
 def main():
     print("=" * 50)
-    print("IRONCORE AGENTS v9.1 - IRIS (Modular)")
-    print(f"LLM: {DEEPSEEK_MODEL}")
+    print("IRONCORE AGENTS v9.1 - IRIS")
+    print(f"LLM: DeepSeek V3")
     print(f"Image: FLUX via Pollinations")
     print(f"GitHub: {'OK' if GITHUB_TOKEN else 'N/A'}")
     print(f"{datetime.now(BRT):%d/%m/%Y %H:%M:%S}")
@@ -730,10 +1358,10 @@ def main():
     app.add_handler(CommandHandler("foco", cmd_foco))
     app.add_handler(CommandHandler("lembretes", cmd_lembretes))
     app.add_handler(CommandHandler("status", lambda u, c: u.message.reply_text(
-        f"=== IRIS v9.1 (Modular) ===\n{datetime.now(BRT):%d/%m/%Y %H:%M}\n"
-        f"LLM: {DEEPSEEK_MODEL}\nImage: FLUX/Pollinations\n"
+        f"=== IRIS v9.1 ===\n{datetime.now(BRT):%d/%m/%Y %H:%M}\n"
+        f"LLM: DeepSeek V3\nImage: FLUX/Pollinations\n"
         f"Gmail: {'OK' if GMAIL_EMAIL else 'N/A'}\n"
-        f"GitHub: {'OK' if GITHUB_TOKEN else 'N/A'}\n"
+        f"GitHub: {'OK' if GITHUB_TOKEN else 'N/A'} ({GITHUB_USER})\n"
         f"Chat ID: {u.effective_chat.id}\nOperacional.")))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, iris_handle))
@@ -750,7 +1378,7 @@ def main():
     else:
         print("[NIGHT] TELEGRAM_CHAT_ID nao configurado.")
 
-    print(f"\nIRIS v9.1 (Modular) pronta.\n")
+    print(f"\nIRIS v9.1 pronta.\n")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
